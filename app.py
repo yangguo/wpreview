@@ -4,6 +4,7 @@ import pandas as pd
 from checkwp import wpreview
 from utils import display_entities
 
+
 def main():
 
     # choose input method of manual or upload file
@@ -32,12 +33,12 @@ def main():
 
             # choose header row
             header_row = st.number_input('选择表头行',
-                                            min_value=0,
-                                            max_value=10,
-                                            value=0)
+                                         min_value=0,
+                                         max_value=10,
+                                         value=0)
             df = pd.read_excel(upload_file,
-                                header=header_row,
-                                sheet_name=sheet_name)
+                               header=header_row,
+                               sheet_name=sheet_name)
             # filllna
             df = df.fillna('')
             # display the first five rows
@@ -53,17 +54,17 @@ def main():
             audit_list = df[audit_col].tolist()
 
     x = st.sidebar.slider('语句匹配阈值%',
-                            min_value=0,
-                            max_value=100,
-                            value=80,
-                            key='sentence')
+                          min_value=0,
+                          max_value=100,
+                          value=80,
+                          key='sentence')
     threshold = x / 100
     st.sidebar.write('语句阈值:', threshold)
     y = st.sidebar.slider(' 关键词匹配阈值%',
-                            min_value=0,
-                            max_value=100,
-                            value=60,
-                            key='key')
+                          min_value=0,
+                          max_value=100,
+                          value=60,
+                          key='key')
     threshold_key = y / 100
     st.sidebar.write('关键词阈值:', threshold_key)
     top = st.sidebar.slider('关键词数量选择', min_value=1, max_value=10, value=5)
@@ -72,7 +73,8 @@ def main():
 
     if search:
         # compare lengths of the two lists and list not empty
-        if len(proc_list) > 0 and len(audit_list) > 0 and len(proc_list) == len(audit_list):
+        if len(proc_list) > 0 and len(audit_list) > 0 and len(
+                proc_list) == len(audit_list):
             # split list into batch of 5
             batch_num = 5
             proc_list_batch = [
@@ -90,28 +92,29 @@ def main():
                     zip(proc_list_batch, audit_list_batch)):
 
                 with st.spinner('正在检查...'):
-                    dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_ent_words, audit_ent_words,proc_keywords = wpreview(
-                        proc_batch, audit_batch, threshold, threshold_key,
-                        top)
+                    dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_keywords = wpreview(
+                        proc_batch, audit_batch, threshold, threshold_key, top)
                     # range of the batch
                     start = j * batch_num + 1
                     end = start + len(proc_batch) - 1
 
-                    st.subheader('内容检查：'+f'第{start}-{end}条')
-                    for i, (proc,audit,distance, empty, keywordls,proc_text,audit_text) in enumerate(
+                    st.subheader('内容检查：' + f'第{start}-{end}条')
+                    for i, (proc, audit, distance, empty, keywordls, proc_text,
+                            audit_text) in enumerate(
                                 zip(highlight_proc, highlight_audit,
-                                    distancels, emptyls,proc_keywords,proc_batch,audit_batch)):
+                                    distancels, emptyls, proc_keywords,
+                                    proc_batch, audit_batch)):
                         count = str(j * batch_num + i + 1)
                         st.warning('测试步骤' + count + ': ')
-                        display_entities(proc_text,str(count)+'_proc')
+                        display_entities(proc_text, str(count) + '_proc')
 
                         # keywords list to string
                         keywords = ','.join(keywordls)
                         st.markdown('关键词：' + keywords)
 
                         st.warning('现状描述' + count + ': ')
-                        display_entities(audit_text,str(count)+'_audit')
-                        
+                        display_entities(audit_text, str(count) + '_audit')
+
                         st.warning('检查结果' + count + ': ')
                         # combine empty list to text
                         empty_text = ' '.join(empty)
@@ -122,19 +125,19 @@ def main():
                         else:
                             st.error('不通过: ' + str(distance))
                     dfls.append(df)
-            
+
             # review is done
             st.sidebar.success('检查完成')
             # download df
             alldf = pd.concat(dfls)
             st.sidebar.download_button(label='下载结果',
-                                data=alldf.to_csv(),
-                                file_name='审计底稿检查.csv',
-                                mime='text/csv')
+                                       data=alldf.to_csv(),
+                                       file_name='审计底稿检查.csv',
+                                       mime='text/csv')
         else:
             st.warning('请检查输入')
             st.error('输入列表长度不一致或空值(测试步骤:' + str(len(proc_list)) + ' 现状描述:' +
-                        str(len(audit_list)) + ')')
+                     str(len(audit_list)) + ')')
 
 
 if __name__ == '__main__':
