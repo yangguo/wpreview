@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import asyncio
 import torch
-import jieba
+import jieba.analyse
 import spacy
 
 from textrank4zh import TextRank4Sentence
