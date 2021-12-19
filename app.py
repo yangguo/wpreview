@@ -92,12 +92,16 @@ def main():
                     zip(proc_list_batch, audit_list_batch)):
 
                 with st.spinner('正在检查...'):
-                    dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_keywords = wpreview(
-                        proc_batch, audit_batch, threshold, threshold_key, top)
                     # range of the batch
                     start = j * batch_num + 1
                     end = start + len(proc_batch) - 1
+                    st.subheader('整体检查：'+f'第{start}-{end}条')
+                    dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_keywords = wpreview(
+                        proc_batch, audit_batch, threshold, threshold_key, top)
 
+                    # display the result
+                    st.dataframe(dfsty)
+                    
                     st.subheader('内容检查：' + f'第{start}-{end}条')
                     for i, (proc, audit, distance, empty, keywordls, proc_text,
                             audit_text) in enumerate(
