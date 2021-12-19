@@ -4,6 +4,7 @@ import asyncio
 import torch
 import jieba.analyse
 import spacy
+from spacy_streamlit import visualize_ner
 
 from textrank4zh import TextRank4Sentence
 from transformers import RoFormerModel, RoFormerTokenizer
@@ -168,3 +169,14 @@ def text2emb(text):
     # cut text into words
     doc = nlp(text)
     return doc
+
+
+# display entities using spacy
+def display_entities(text, key):
+    doc = nlp(text)
+    visualize_ner(doc,
+                  labels=nlp.get_pipe("ner").labels,
+                #   labels=None,
+                  key=key,
+                  show_table=False,
+                  title=None)

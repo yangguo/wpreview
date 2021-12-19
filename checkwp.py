@@ -36,10 +36,6 @@ def wpreview(proc_list, audit_list, threshold=0.5, threshold_key=0.5, topn=5):
     proc_keywords = [tfidfkeyword(proc, topn) for proc in proc_list]
     # audit_keywords = [textrankkeyword(audit) for audit in audit_list]
 
-    # get ent words from proc_list and audit_list
-    proc_ent_words = [get_ent_words(proc) for proc in proc_list]
-    audit_ent_words = [get_ent_words(audit) for audit in audit_list]
-
     audit_keywords = []
     emptyls = []
     for keyls, audit in zip(proc_keywords, audit_list):
@@ -83,7 +79,7 @@ def wpreview(proc_list, audit_list, threshold=0.5, threshold_key=0.5, topn=5):
                               subset=['检查结果'])
     # dfsty = df.style.applymap(color_range, subset=['检查结果'])
 
-    return dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_ent_words, audit_ent_words,proc_keywords
+    return dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_keywords
 
 
 # set bankground gradient color based on val and x

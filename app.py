@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
-import tracemalloc
 
 from checkwp import wpreview
+from utils import display_entities
 
 def main():
 
@@ -71,7 +71,6 @@ def main():
     search = st.sidebar.button('差异检查')
 
     if search:
-        tracemalloc.start()
         # compare lengths of the two lists and list not empty
         if len(proc_list) > 0 and len(audit_list) > 0 and len(proc_list) == len(audit_list):
             # split list into batch of 5
@@ -97,30 +96,21 @@ def main():
                     # range of the batch
                     start = j * batch_num + 1
                     end = start + len(proc_batch) - 1
-                    st.subheader('整体检查：'+f'第{start}-{end}条')
-    
-                    st.table(dfsty)
 
                     st.subheader('内容检查：'+f'第{start}-{end}条')
-                    for i, (proc, audit, distance, empty, proc_ent,
-                            audit_ent,keywordls) in enumerate(
+                    for i, (proc,audit,distance, empty, keywordls,proc_text,audit_text) in enumerate(
                                 zip(highlight_proc, highlight_audit,
-                                    distancels, emptyls, proc_ent_words,
-                                    audit_ent_words,proc_keywords)):
+                                    distancels, emptyls,proc_keywords,proc_batch,audit_batch)):
                         count = str(j * batch_num + i + 1)
                         st.warning('测试步骤' + count + ': ')
-                        st.markdown(proc, unsafe_allow_html=True)
+                        display_entities(proc_text,str(count)+'_proc')
+
                         # keywords list to string
                         keywords = ','.join(keywordls)
                         st.markdown('关键词：' + keywords)
-                        st.write('关键内容:')
-                        st.table(proc_ent)
 
                         st.warning('现状描述' + count + ': ')
-                        st.markdown(audit, unsafe_allow_html=True)
-                        # print audit_ent df
-                        st.write('关键内容:')
-                        st.table(audit_ent)
+                        display_entities(audit_text,str(count)+'_audit')
                         
                         st.warning('检查结果' + count + ': ')
                         # combine empty list to text
@@ -132,17 +122,6 @@ def main():
                         else:
                             st.error('不通过: ' + str(distance))
                     dfls.append(df)
-                # check memory usage
-                current, peak = tracemalloc.get_traced_memory()
-                st.write(f'当前内存占用: {current / 10**6}MB')
-                st.write(f'最大内存占用: {peak / 10**6}MB')
-
-                snapshot = tracemalloc.take_snapshot()
-                top_stats = snapshot.statistics('lineno')
-
-                print("[ Top 10 ]")
-                for stat in top_stats[:10]:
-                    print(stat)
             
             # review is done
             st.sidebar.success('检查完成')
@@ -156,8 +135,6 @@ def main():
             st.warning('请检查输入')
             st.error('输入列表长度不一致或空值(测试步骤:' + str(len(proc_list)) + ' 现状描述:' +
                         str(len(audit_list)) + ')')
-        
-        tracemalloc.stop()
 
 
 if __name__ == '__main__':
