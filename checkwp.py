@@ -1,7 +1,5 @@
-from operator import sub
-import re
 import pandas as pd
-import scipy
+import scipy.spatial
 
 from utils import  tfidfkeyword, sent2emb_async, text2emb, find_similar_words, replace_color, get_ent_words
 
