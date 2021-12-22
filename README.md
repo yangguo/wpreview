@@ -1,5 +1,5 @@
 ---
-title: Wpreview
+title: workpaper NLP reviewer
 emoji: 👁
 colorFrom: indigo
 colorTo: gray
