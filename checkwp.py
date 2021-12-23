@@ -20,8 +20,6 @@ def wpreview(proc_list, audit_list, threshold=0.5, threshold_key=0.5, topn=5):
     df : pandas.DataFrame
         dataframe with proc_list and audit_list
     """
-    # proc_embeddings = sent2emb(proc_list)
-    # audit_embeddings = sent2emb(audit_list)
     proc_embeddings = sent2emb_async(proc_list)
     audit_embeddings = sent2emb_async(audit_list)
 
@@ -63,21 +61,16 @@ def wpreview(proc_list, audit_list, threshold=0.5, threshold_key=0.5, topn=5):
 
     # display proc_list, audit_list, distancels,emptyls in a table
     df = pd.DataFrame({
-        '测试步骤': proc_list,
-        '现状描述': audit_list,
-        '检查结果': distancels,
-        '缺失内容': emptyls
+        'Testing Procedure': proc_list,
+        'Testing Description': audit_list,
+        'Review Result': distancels,
+        'Missing': emptyls
     })
 
-    # add keyword extraction
-    # df['步骤关键词'] = df['测试步骤'].apply(tfidfkeyword)
-    # df['现状关键词'] = df['现状描述'].apply(textrankkeyword)
 
     # set df style background color gradient based on distance and threshold
-    # df['检查结果'] = df['检查结果'].apply(lambda x: color_range(x,threshold))
     dfsty = df.style.applymap(lambda x: color_range(x, threshold),
-                              subset=['检查结果'])
-    # dfsty = df.style.applymap(color_range, subset=['检查结果'])
+                              subset=['Review Result'])
 
     return dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_keywords
 

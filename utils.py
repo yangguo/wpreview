@@ -142,8 +142,8 @@ def get_ent_words(text):
         textls.append(ent.text)
 
     # combine labels and text into df ordered by labels
-    df = pd.DataFrame({'类型': labels, '文本': textls})
-    df = df.sort_values(by='类型')
+    df = pd.DataFrame({'Category': labels, 'Text': textls})
+    df = df.sort_values(by='Category')
     return df
 
 

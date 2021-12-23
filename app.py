@@ -95,14 +95,14 @@ def main():
                     # range of the batch
                     start = j * batch_num + 1
                     end = start + len(proc_batch) - 1
-                    st.subheader('Overview:'+f'From{start}to{end}')
+                    st.subheader('Overview: '+f'{start}to{end}')
                     dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_keywords = wpreview(
                         proc_batch, audit_batch, threshold, threshold_key, top)
 
                     # display the result
                     st.dataframe(dfsty)
 
-                    st.subheader('Content:' + f'From{start}to{end}')
+                    st.subheader('Content: ' + f'{start}to{end}')
                     for i, (proc, audit, distance, empty, keywordls, proc_text,
                             audit_text) in enumerate(
                                 zip(highlight_proc, highlight_audit,
