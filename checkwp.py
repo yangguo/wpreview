@@ -1,7 +1,8 @@
 import pandas as pd
 import scipy.spatial
 
-from utils import  tfidfkeyword, sent2emb_async, text2emb, find_similar_words, replace_color, get_ent_words
+from utils import tfidfkeyword, sent2emb_async, text2emb, find_similar_words, replace_color, get_ent_words
+from corrector import corrector
 
 
 def wpreview(proc_list, audit_list, threshold=0.5, threshold_key=0.5, topn=5):
@@ -59,20 +60,28 @@ def wpreview(proc_list, audit_list, threshold=0.5, threshold_key=0.5, topn=5):
     # change audit_list keywords color red by audit_keywords using markdown
     highlight_audit = replace_color(audit_list, audit_keywords, 'red')
 
+    result_list = corrector(audit_list)
+
+    errorls = []
+    # list of search list and result list
+    for result in result_list:
+        _, details = result
+        errorls.append(details)
+
     # display proc_list, audit_list, distancels,emptyls in a table
     df = pd.DataFrame({
         'Testing Procedure': proc_list,
         'Testing Description': audit_list,
         'Review Result': distancels,
-        'Missing': emptyls
+        'Missing': emptyls,
+        'Error': errorls
     })
-
 
     # set df style background color gradient based on distance and threshold
     dfsty = df.style.applymap(lambda x: color_range(x, threshold),
                               subset=['Review Result'])
 
-    return dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_keywords
+    return dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_keywords, errorls
 
 
 # set bankground gradient color based on val and x

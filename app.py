@@ -67,7 +67,10 @@ def main():
                           key='key')
     threshold_key = y / 100
     st.sidebar.write('Keyword Threshold:', threshold_key)
-    top = st.sidebar.slider('Keyword Number', min_value=1, max_value=10, value=5)
+    top = st.sidebar.slider('Keyword Number',
+                            min_value=1,
+                            max_value=10,
+                            value=5)
 
     search = st.sidebar.button('Review')
 
@@ -95,19 +98,19 @@ def main():
                     # range of the batch
                     start = j * batch_num + 1
                     end = start + len(proc_batch) - 1
-                    st.subheader('Overview: '+f'{start}to{end}')
-                    dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_keywords = wpreview(
+                    st.subheader('Overview: ' + f'{start}to{end}')
+                    dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_keywords, errorls = wpreview(
                         proc_batch, audit_batch, threshold, threshold_key, top)
 
                     # display the result
                     st.dataframe(dfsty)
 
                     st.subheader('Content: ' + f'{start}to{end}')
-                    for i, (proc, audit, distance, empty, keywordls, proc_text,
-                            audit_text) in enumerate(
+                    for i, (proc, audit, distance, empty, keywordls, error,
+                            proc_text, audit_text) in enumerate(
                                 zip(highlight_proc, highlight_audit,
                                     distancels, emptyls, proc_keywords,
-                                    proc_batch, audit_batch)):
+                                    errorls, proc_batch, audit_batch)):
                         count = str(j * batch_num + i + 1)
                         st.warning('Procedure' + count + ': ')
                         display_entities(proc_text, str(count) + '_proc')
@@ -123,6 +126,10 @@ def main():
                         # combine empty list to text
                         empty_text = ' '.join(empty)
                         st.error('Missing: ' + empty_text)
+
+                        # combine error list to text
+                        error_text = ' '.join(error)
+                        st.error('Error: ' + error_text)
 
                         if distance >= threshold:
                             st.success('Pass: ' + str(distance))
@@ -140,8 +147,10 @@ def main():
                                        mime='text/csv')
         else:
             st.warning('Please check your input')
-            st.error('Input is blank or inconsistent length(Testing Procedure:' + str(len(proc_list)) + ' Testing Description:' +
-                     str(len(audit_list)) + ')')
+            st.error(
+                'Input is blank or inconsistent length(Testing Procedure:' +
+                str(len(proc_list)) + ' Testing Description:' +
+                str(len(audit_list)) + ')')
 
 
 if __name__ == '__main__':
