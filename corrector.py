@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import operator
 import torch
@@ -49,3 +50,18 @@ def corrector(texts):
         corrected_text, details = get_errors(corrected_text, text)
         result.append((corrected_text, details))
     return result
+
+
+# replace each word in list based on start and end index
+def highlight_word(text_list, start, end, newtxt):
+    new_text_list = newtxt
+    upttxt = []
+    for txt in new_text_list:
+        upttxt.append('<span style="color:red">{}</span>'.format(txt))
+    return text_list[:start] + upttxt + text_list[end:]
+
+# convert tuple list to string list
+def tup2list(tupls):
+    strls=[str(x) for x in tupls] 
+    text = ' '.join(strls)
+    return text

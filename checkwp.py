@@ -2,7 +2,7 @@ import pandas as pd
 import scipy.spatial
 
 from utils import tfidfkeyword, sent2emb_async, text2emb, find_similar_words, replace_color, get_ent_words
-from corrector import corrector
+from corrector import corrector,tup2list
 
 
 def wpreview(proc_list, audit_list, threshold=0.5, threshold_key=0.5, topn=5):
@@ -38,8 +38,7 @@ def wpreview(proc_list, audit_list, threshold=0.5, threshold_key=0.5, topn=5):
     audit_keywords = []
     emptyls = []
     for keyls, audit in zip(proc_keywords, audit_list):
-        # print(keyls)
-
+    
         doc = text2emb(audit)
         result = find_similar_words(keyls, doc, threshold_key, top_n=3)
         subls = []
@@ -63,18 +62,21 @@ def wpreview(proc_list, audit_list, threshold=0.5, threshold_key=0.5, topn=5):
     result_list = corrector(audit_list)
 
     errorls = []
+    dferrorls = []
     # list of search list and result list
     for result in result_list:
         _, details = result
         errorls.append(details)
+        dferrorls.append(tup2list(details))
+    
 
-    # display proc_list, audit_list, distancels,emptyls in a table
+     # display proc_list, audit_list, distancels,emptyls in a table
     df = pd.DataFrame({
         'Testing Procedure': proc_list,
         'Testing Description': audit_list,
         'Review Result': distancels,
         'Missing': emptyls,
-        'Error': errorls
+        'Error text': dferrorls
     })
 
     # set df style background color gradient based on distance and threshold

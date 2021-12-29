@@ -3,6 +3,7 @@ import pandas as pd
 
 from checkwp import wpreview
 from utils import display_entities
+from corrector import highlight_word,tup2list
 
 
 def main():
@@ -98,14 +99,14 @@ def main():
                     # range of the batch
                     start = j * batch_num + 1
                     end = start + len(proc_batch) - 1
-                    st.subheader('Overview: ' + f'{start}to{end}')
+                    st.subheader('Overview: ' + f'{start}-{end}')
                     dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_keywords, errorls = wpreview(
                         proc_batch, audit_batch, threshold, threshold_key, top)
 
                     # display the result
-                    st.dataframe(dfsty)
+                    st.write(dfsty)
 
-                    st.subheader('Content: ' + f'{start}to{end}')
+                    st.subheader('Content: ' + f'{start}-{end}')
                     for i, (proc, audit, distance, empty, keywordls, error,
                             proc_text, audit_text) in enumerate(
                                 zip(highlight_proc, highlight_audit,
@@ -124,12 +125,27 @@ def main():
 
                         st.warning('Review Result' + count + ': ')
                         # combine empty list to text
-                        empty_text = ' '.join(empty)
-                        st.error('Missing: ' + empty_text)
+                        if empty:
+                            empty_text = ' '.join(empty)
+                            st.error('Missing Keyword: ' + empty_text)
+                        else:
+                            st.success('No Missing Keyword')
 
                         # combine error list to text
-                        error_text = ' '.join(error)
-                        st.error('Error: ' + error_text)
+
+                        if error:
+                            error_text=tup2list(error)
+                            st.error('Error Found: '+error_text)
+                            for detail in error:
+                                corrected_hl = list(audit_text)
+                                corrected_hl = highlight_word(corrected_hl, detail[2],
+                                                                detail[3],detail[1])
+
+                                corrected_hlstr = ''.join(corrected_hl)
+                                st.markdown('Corrected text: ' + corrected_hlstr,
+                                            unsafe_allow_html=True)
+                        else:
+                            st.success('No error found in text')
 
                         if distance >= threshold:
                             st.success('Pass: ' + str(distance))
