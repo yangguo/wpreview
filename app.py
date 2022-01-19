@@ -1,5 +1,7 @@
 import streamlit as st
 import pandas as pd
+import docx
+import numpy as np
 
 from checkwp import wpreview
 from utils import display_entities
@@ -23,50 +25,88 @@ def main():
         audit_list = list(filter(lambda item: item.strip(), audit_list))
 
     elif input_method == 'Upload File':
-        # upload excel file
-        upload_file = st.file_uploader('Upload workpaper', type=['xlsx'])
+        # upload file
+        upload_file = st.file_uploader('Upload workpaper', type=['xlsx','docx'])
         if upload_file is not None:
-            # get sheet names list from excel file
-            xls = pd.ExcelFile(upload_file)
-            sheets = xls.sheet_names
-            # choose sheet name and click button
-            sheet_name = st.selectbox('Choose sheetname', sheets)
+            # if upload file is xlsx
+            if upload_file.type == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
+                # get sheet names list from excel file
+                xls = pd.ExcelFile(upload_file)
+                sheets = xls.sheet_names
+                # choose sheet name and click button
+                sheet_name = st.selectbox('Choose sheetname', sheets)
 
-            # choose header row
-            header_row = st.number_input('Choose header row',
-                                         min_value=0,
-                                         max_value=10,
-                                         value=0)
-            df = pd.read_excel(upload_file,
-                               header=header_row,
-                               sheet_name=sheet_name)
-            # filllna
-            df = df.fillna('')
-            # display the first five rows
-            st.write(df.astype(str))
+                # choose header row
+                header_row = st.number_input('Choose header row',
+                                            min_value=0,
+                                            max_value=10,
+                                            value=0)
+                df = pd.read_excel(upload_file,
+                                header=header_row,
+                                sheet_name=sheet_name)
+                # filllna
+                df = df.fillna('')
+                # display the first five rows
+                st.write(df.astype(str))
 
-            # get df columns
-            cols = df.columns
-            # choose proc_text and audit_text column
-            proc_col = st.sidebar.selectbox('Choose procedure column', cols)
-            audit_col = st.sidebar.selectbox('Choose testing column', cols)
-            # get proc_text and audit_text list
-            proc_list = df[proc_col].tolist()
-            audit_list = df[audit_col].tolist()
+                # get df columns
+                cols = df.columns
+                # choose proc_text and audit_text column
+                proc_col = st.sidebar.selectbox('Choose procedure column', cols)
+                audit_col = st.sidebar.selectbox('Choose testing column', cols)
+                # get proc_text and audit_text list
+                proc_list = df[proc_col].tolist()
+                audit_list = df[audit_col].tolist()
 
-    x = st.sidebar.slider('Sentence Matching Threshold%',
-                          min_value=0,
-                          max_value=100,
-                          value=80,
+            elif upload_file.type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+                # read docx file
+                document = docx.Document(upload_file)
+                # choose header row
+                header_row = st.number_input('Choose header row',
+                                            min_value=0,
+                                            max_value=10,
+                                            value=0)
+                # get table data
+                data=[]
+                for table in document.tables:
+                    tb=[]
+                    for row in table.rows:
+                        rl=[]
+                        for cell in row.cells:
+                            rl.append(cell.text)
+                        tb.append(rl)
+                    data.append(tb)
+                dataarray=np.array(data)
+                shape=dataarray.shape
+                dataarray1=dataarray.reshape(shape[0]*shape[1],shape[2])
+
+                dataarray2=dataarray1[header_row:,:]
+                df=pd.DataFrame(dataarray2)
+
+                st.write(df.astype(str))
+ 
+                # get df columns
+                cols = df.columns
+                # choose proc_text and audit_text column
+                proc_col = st.sidebar.selectbox('Choose procedure column', cols)
+                audit_col = st.sidebar.selectbox('Choose testing column', cols)
+                # get proc_text and audit_text list
+                proc_list = df[proc_col].tolist()
+                audit_list = df[audit_col].tolist()
+
+    threshold = st.sidebar.slider('Sentence Matching Threshold',
+                          min_value=0.0,
+                          max_value=1.0,
+                          value=0.8,
                           key='sentence')
-    threshold = x / 100
+    
     st.sidebar.write('Sentence Threshold:', threshold)
-    y = st.sidebar.slider('Keyword Matching Threshold%',
-                          min_value=0,
-                          max_value=100,
-                          value=60,
+    threshold_key = st.sidebar.slider('Keyword Matching Threshold',
+                          min_value=0.0,
+                          max_value=1.0,
+                          value=0.6,
                           key='key')
-    threshold_key = y / 100
+
     st.sidebar.write('Keyword Threshold:', threshold_key)
     top = st.sidebar.slider('Keyword Number',
                             min_value=1,
