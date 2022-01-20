@@ -61,13 +61,8 @@ def main():
             elif upload_file.type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
                 # read docx file
                 document = docx.Document(upload_file)
-                # choose header row
-                header_row = st.number_input('Choose header row',
-                                            min_value=0,
-                                            max_value=10,
-                                            value=0)
                 # get table data
-                data=[]
+                tablels=[]
                 for table in document.tables:
                     tb=[]
                     for row in table.rows:
@@ -75,24 +70,39 @@ def main():
                         for cell in row.cells:
                             rl.append(cell.text)
                         tb.append(rl)
-                    data.append(tb)
-                dataarray=np.array(data)
-                shape=dataarray.shape
-                dataarray1=dataarray.reshape(shape[0]*shape[1],shape[2])
+                    tablels.append(tb)
 
-                dataarray2=dataarray1[header_row:,:]
-                df=pd.DataFrame(dataarray2)
+                # get tablels index list
+                tablels_index = list(range(len(tablels)))
+                # choose tablels index
+                tablels_no = st.selectbox('Choose table index', tablels_index)
+                # choose header row
+                header_row = st.number_input('Choose header row',
+                                            min_value=0,
+                                            max_value=10,
+                                            value=0)
 
-                st.write(df.astype(str))
- 
-                # get df columns
-                cols = df.columns
-                # choose proc_text and audit_text column
-                proc_col = st.sidebar.selectbox('Choose procedure column', cols)
-                audit_col = st.sidebar.selectbox('Choose testing column', cols)
-                # get proc_text and audit_text list
-                proc_list = df[proc_col].tolist()
-                audit_list = df[audit_col].tolist()
+                if tablels_no is not None:
+                    # get tablels
+                    data = tablels[tablels_no]
+                    dataarray=np.array(data)
+                    dataarray2=dataarray[header_row:,:]
+                    df=pd.DataFrame(dataarray2)
+
+                    st.write(df.astype(str))
+    
+                    # get df columns
+                    cols = df.columns
+                    # choose proc_text and audit_text column
+                    proc_col = st.sidebar.selectbox('Choose procedure column', cols)
+                    audit_col = st.sidebar.selectbox('Choose testing column', cols)
+                    # get proc_text and audit_text list
+                    proc_list = df[proc_col].tolist()
+                    audit_list = df[audit_col].tolist()
+                else:
+                    st.error('No table found in the document')
+                    proc_list = []
+                    audit_list = []
 
     threshold = st.sidebar.slider('Sentence Matching Threshold',
                           min_value=0.0,
