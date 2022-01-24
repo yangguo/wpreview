@@ -17,10 +17,10 @@ def main():
         proc_text = st.text_area('Testing Procedures')
         audit_text = st.text_area('Testing Descriptions')
 
-        proc_list = proc_text.split()
+        proc_list = proc_text.split('/')
         # filter blank item
         proc_list = list(filter(lambda item: item.strip(), proc_list))
-        audit_list = audit_text.split()
+        audit_list = audit_text.split('/')
         # filter blank item
         audit_list = list(filter(lambda item: item.strip(), audit_list))
 
