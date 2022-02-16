@@ -103,6 +103,10 @@ def main():
                     st.error('No table found in the document')
                     proc_list = []
                     audit_list = []
+        else:
+            st.error('No file selected')
+            proc_list = []
+            audit_list = []
 
     threshold = st.sidebar.slider('Sentence Matching Threshold',
                           min_value=0.0,
@@ -123,100 +127,118 @@ def main():
                             max_value=10,
                             value=5)
 
+   # get proc_list and audit_list length
+    proc_len = len(proc_list)
+    audit_len = len(audit_list)
+
+    # if proc_list or audit_list is empty or not equal
+    if proc_len == 0 or audit_len == 0 or proc_len != audit_len:
+        st.error('Procedure and Testing list must be equal and not empty')
+        st.error(
+            '(Testing Procedure:' +
+            str(len(proc_list)) + '/ Testing Description:' +
+            str(len(audit_list)) + ')')
+        return
+    else:
+        # choose start and end index
+        start_idx = st.sidebar.number_input('Choose start index',
+                                min_value=0,
+                                max_value=proc_len-1,
+                                value=0)
+        end_idx = st.sidebar.number_input('Choose end index',
+                              min_value=start_idx,
+                              max_value=proc_len-1,
+                              value=proc_len-1)
+
+        # get proc_list and audit_list
+        subproc_list = proc_list[start_idx:end_idx+1]
+        subaudit_list = audit_list[start_idx:end_idx+1]
+
     search = st.sidebar.button('Review')
-
+  
     if search:
-        # compare lengths of the two lists and list not empty
-        if len(proc_list) > 0 and len(audit_list) > 0 and len(
-                proc_list) == len(audit_list):
-            # split list into batch of 5
-            batch_num = 5
-            proc_list_batch = [
-                proc_list[i:i + batch_num]
-                for i in range(0, len(proc_list), batch_num)
-            ]
-            audit_list_batch = [
-                audit_list[i:i + batch_num]
-                for i in range(0, len(audit_list), batch_num)
-            ]
+        # split list into batch of 5
+        batch_num = 5
+        proc_list_batch = [
+            subproc_list[i:i + batch_num]
+            for i in range(0, len(subproc_list), batch_num)
+        ]
+        audit_list_batch = [
+            subaudit_list[i:i + batch_num]
+            for i in range(0, len(subaudit_list), batch_num)
+        ]
 
-            dfls = []
-            # get proc and audit batch
-            for j, (proc_batch, audit_batch) in enumerate(
-                    zip(proc_list_batch, audit_list_batch)):
+        dfls = []
+        # get proc and audit batch
+        for j, (proc_batch, audit_batch) in enumerate(
+                zip(proc_list_batch, audit_list_batch)):
 
-                with st.spinner('Reviewing...'):
-                    # range of the batch
-                    start = j * batch_num + 1
-                    end = start + len(proc_batch) - 1
-                    st.subheader('Overview: ' + f'{start}-{end}')
-                    dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_keywords, errorls = wpreview(
-                        proc_batch, audit_batch, threshold, threshold_key, top)
+            with st.spinner('Reviewing...'):
+                # range of the batch
+                start = j * batch_num + 1
+                end = start + len(proc_batch) - 1
+                st.subheader('Overview: ' + f'{start}-{end}')
+                dfsty, df, highlight_proc, highlight_audit, distancels, emptyls, proc_keywords, errorls = wpreview(
+                    proc_batch, audit_batch, threshold, threshold_key, top)
 
-                    # display the result
-                    st.write(dfsty)
+                # display the result
+                st.write(dfsty)
 
-                    st.subheader('Content: ' + f'{start}-{end}')
-                    for i, (proc, audit, distance, empty, keywordls, error,
-                            proc_text, audit_text) in enumerate(
-                                zip(highlight_proc, highlight_audit,
-                                    distancels, emptyls, proc_keywords,
-                                    errorls, proc_batch, audit_batch)):
-                        count = str(j * batch_num + i + 1)
-                        st.warning('Procedure' + count + ': ')
-                        display_entities(proc_text, str(count) + '_proc')
+                st.subheader('Content: ' + f'{start}-{end}')
+                for i, (proc, audit, distance, empty, keywordls, error,
+                        proc_text, audit_text) in enumerate(
+                            zip(highlight_proc, highlight_audit,
+                                distancels, emptyls, proc_keywords,
+                                errorls, proc_batch, audit_batch)):
+                    count = str(j * batch_num + i + 1)
+                    st.warning('Procedure ' + count + ': ')
+                    display_entities(proc_text, str(count) + '_proc')
 
-                        # keywords list to string
-                        keywords = ','.join(keywordls)
-                        st.markdown('Keyword:' + keywords)
+                    # keywords list to string
+                    keywords = ','.join(keywordls)
+                    st.markdown('Keyword:' + keywords)
 
-                        st.warning('Testing Description' + count + ': ')
-                        display_entities(audit_text, str(count) + '_audit')
+                    st.warning('Testing Description ' + count + ': ')
+                    display_entities(audit_text, str(count) + '_audit')
 
-                        st.warning('Review Result' + count + ': ')
-                        # combine empty list to text
-                        if empty:
-                            empty_text = ' '.join(empty)
-                            st.error('Missing Keyword: ' + empty_text)
-                        else:
-                            st.success('No Missing Keyword')
+                    st.warning('Review Result ' + count + ': ')
+                    # combine empty list to text
+                    if empty:
+                        empty_text = ' '.join(empty)
+                        st.error('Missing Keyword: ' + empty_text)
+                    else:
+                        st.success('No Missing Keyword')
 
-                        # combine error list to text
+                    # combine error list to text
 
-                        if error:
-                            error_text=tup2list(error)
-                            st.error('Error Found: '+error_text)
-                            for detail in error:
-                                corrected_hl = list(audit_text)
-                                corrected_hl = highlight_word(corrected_hl, detail[2],
-                                                                detail[3],detail[1])
+                    if error:
+                        error_text=tup2list(error)
+                        st.error('Error Found: '+error_text)
+                        for detail in error:
+                            corrected_hl = list(audit_text)
+                            corrected_hl = highlight_word(corrected_hl, detail[2],
+                                                            detail[3],detail[1])
 
-                                corrected_hlstr = ''.join(corrected_hl)
-                                st.markdown('Corrected text: ' + corrected_hlstr,
-                                            unsafe_allow_html=True)
-                        else:
-                            st.success('No error found in text')
+                            corrected_hlstr = ''.join(corrected_hl)
+                            st.markdown('Corrected text: ' + corrected_hlstr,
+                                        unsafe_allow_html=True)
+                    else:
+                        st.success('No error found in text')
 
-                        if distance >= threshold:
-                            st.success('Pass: ' + str(distance))
-                        else:
-                            st.error('Fail: ' + str(distance))
-                    dfls.append(df)
+                    if distance >= threshold:
+                        st.success('Pass: ' + str(distance))
+                    else:
+                        st.error('Fail: ' + str(distance))
+                dfls.append(df)
 
-            # review is done
-            st.sidebar.success('Review Finish')
-            # download df
-            alldf = pd.concat(dfls)
-            st.sidebar.download_button(label='Download',
-                                       data=alldf.to_csv(),
-                                       file_name='WPreviewresult.csv',
-                                       mime='text/csv')
-        else:
-            st.warning('Please check your input')
-            st.error(
-                'Input is blank or inconsistent length(Testing Procedure:' +
-                str(len(proc_list)) + ' Testing Description:' +
-                str(len(audit_list)) + ')')
+        # review is done
+        st.sidebar.success('Review Finish')
+        # download df
+        alldf = pd.concat(dfls)
+        st.sidebar.download_button(label='Download',
+                                    data=alldf.to_csv(),
+                                    file_name='WPreviewresult.csv',
+                                    mime='text/csv')
 
 
 if __name__ == '__main__':
