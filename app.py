@@ -4,7 +4,7 @@ import docx
 import numpy as np
 
 from checkwp import wpreview
-from utils import display_entities
+from utils import display_entities,get_ner_labels
 from corrector import highlight_word,tup2list
 
 
@@ -108,26 +108,7 @@ def main():
             proc_list = []
             audit_list = []
 
-    threshold = st.sidebar.slider('Sentence Matching Threshold',
-                          min_value=0.0,
-                          max_value=1.0,
-                          value=0.8,
-                          key='sentence')
-    
-    st.sidebar.write('Sentence Threshold:', threshold)
-    threshold_key = st.sidebar.slider('Keyword Matching Threshold',
-                          min_value=0.0,
-                          max_value=1.0,
-                          value=0.6,
-                          key='key')
-
-    st.sidebar.write('Keyword Threshold:', threshold_key)
-    top = st.sidebar.slider('Keyword Number',
-                            min_value=1,
-                            max_value=10,
-                            value=5)
-
-   # get proc_list and audit_list length
+    # get proc_list and audit_list length
     proc_len = len(proc_list)
     audit_len = len(audit_list)
 
@@ -139,17 +120,45 @@ def main():
             str(len(proc_list)) + '/ Testing Description:' +
             str(len(audit_list)) + ')')
         return
-    else:
+
+    with st.sidebar.expander('Parameters'):
+        # choose parameters
+        threshold = st.slider('Sentence Matching Threshold',
+                            min_value=0.0,
+                            max_value=1.0,
+                            value=0.8,
+                            key='sentence')
+        
+        st.write('Sentence Threshold:', threshold)
+        threshold_key = st.slider('Keyword Matching Threshold',
+                            min_value=0.0,
+                            max_value=1.0,
+                            value=0.6,
+                            key='key')
+
+        st.write('Keyword Threshold:', threshold_key)
+        top = st.slider('Keyword Number',
+                                min_value=1,
+                                max_value=10,
+                                value=5)
+        # get ner labels
+        ner_labels = get_ner_labels()
+        # choose ner label using multi-select
+        ner_label = st.multiselect('Choose NER label', ner_labels,ner_labels)
+
         # choose start and end index
-        start_idx = st.sidebar.number_input('Choose start index',
+        start_idx = st.number_input('Choose start index',
                                 min_value=0,
                                 max_value=proc_len-1,
                                 value=0)
-        end_idx = st.sidebar.number_input('Choose end index',
-                              min_value=start_idx,
-                              max_value=proc_len-1,
-                              value=proc_len-1)
-
+        # convert start_idx to int
+        start_idx = int(start_idx)
+        end_idx = st.number_input('Choose end index',
+                            min_value=start_idx,
+                            max_value=proc_len-1,
+                            value=proc_len-1)
+        # convert end_idx to int
+        end_idx = int(end_idx)
         # get proc_list and audit_list
         subproc_list = proc_list[start_idx:end_idx+1]
         subaudit_list = audit_list[start_idx:end_idx+1]
@@ -192,14 +201,14 @@ def main():
                                 errorls, proc_batch, audit_batch)):
                     count = str(j * batch_num + i + 1)
                     st.warning('Procedure ' + count + ': ')
-                    display_entities(proc_text, str(count) + '_proc')
+                    display_entities(proc_text, str(count) + '_proc',ner_label)
 
                     # keywords list to string
                     keywords = ','.join(keywordls)
                     st.markdown('Keyword:' + keywords)
 
                     st.warning('Testing Description ' + count + ': ')
-                    display_entities(audit_text, str(count) + '_audit')
+                    display_entities(audit_text, str(count) + '_audit',ner_label)
 
                     st.warning('Review Result ' + count + ': ')
                     # combine empty list to text

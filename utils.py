@@ -172,11 +172,16 @@ def text2emb(text):
 
 
 # display entities using spacy
-def display_entities(text, key):
+def display_entities(text, key,labels):
     doc = nlp(text)
     visualize_ner(doc,
-                  labels=nlp.get_pipe("ner").labels,
+                  labels=labels,
                 #   labels=None,
                   key=key,
                   show_table=False,
                   title=None)
+
+
+# get nlp ner labels
+def get_ner_labels():
+    return nlp.get_pipe("ner").labels
