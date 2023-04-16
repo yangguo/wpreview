@@ -134,3 +134,9 @@ dmypy.json
 # ignore folders
 .VSCodeCounter
 .vscode
+.trunk
+.flake8
+.isort.cfg
+.markdownlint.yaml
+
+*.json

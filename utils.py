@@ -1,87 +1,18 @@
-import numpy as np
 import pandas as pd
-import asyncio
-import torch
-import jieba.analyse
+import requests
 import spacy
+
+# from keybert import KeyBERT
+# from sentence_transformers import SentenceTransformer
 from spacy_streamlit import visualize_ner
 
-from textrank4zh import TextRank4Sentence
-from transformers import RoFormerModel, RoFormerTokenizer
+# smodel = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
-modelfolder = 'junnyu/roformer_chinese_sim_char_ft_base'
+nlp = spacy.load("zh_core_web_lg")
+# nlp = spacy.load('zh_core_web_trf')
 
-tokenizer = RoFormerTokenizer.from_pretrained(modelfolder)
-model = RoFormerModel.from_pretrained(modelfolder)
-
-# nlp = spacy.load('zh_core_web_lg')
-nlp = spacy.load('zh_core_web_trf')
-
-
-# def async sent2emb(sentences):
-def sent2emb_async(sentences):
-    """
-    run sent2emb in async mode
-    """
-    # create new loop
-    loop = asyncio.new_event_loop()
-    # run async code
-    asyncio.set_event_loop(loop)
-    # run code
-    task = loop.run_until_complete(sent2emb(sentences))
-    # close loop
-    loop.close()
-    return task
-
-
-async def sent2emb(sents):
-    embls = []
-    for sent in sents:
-        # get summary of sent
-        summarize = get_summary(sent)
-        sentence_embedding = roformer_encoder(summarize)
-        embls.append(sentence_embedding)
-    all_embeddings = np.concatenate(embls)
-    return all_embeddings
-
-
-# get summary of text
-def get_summary(text):
-    tr4s = TextRank4Sentence()
-    tr4s.analyze(text=text, lower=True, source='all_filters')
-    sumls = []
-    for item in tr4s.get_key_sentences(num=3):
-        sumls.append(item.sentence)
-    summary = ''.join(sumls)
-    return summary
-
-
-# Mean Pooling - Take attention mask into account for correct averaging
-def mean_pooling(model_output, attention_mask):
-    # First element of model_output contains all token embeddings
-    token_embeddings = model_output[0]
-    input_mask_expanded = attention_mask.unsqueeze(-1).expand(
-        token_embeddings.size()).float()
-    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(
-        input_mask_expanded.sum(1), min=1e-9)
-
-
-def roformer_encoder(sentences):
-    # Tokenize sentences
-    encoded_input = tokenizer(sentences,
-                              max_length=512,
-                              padding=True,
-                              truncation=True,
-                              return_tensors='pt')
-
-    # Compute token embeddings
-    with torch.no_grad():
-        model_output = model(**encoded_input)
-
-    # Perform pooling. In this case, max pooling.
-    sentence_embeddings = mean_pooling(
-        model_output, encoded_input['attention_mask']).numpy()
-    return sentence_embeddings
+# backendurl = "http://backend.docker:8000"
+backendurl = "http://localhost:8000"
 
 
 # replace color of word in text match in word list
@@ -95,17 +26,18 @@ def replace_color(proc_list, proc_keywords, color):
             if sent in proc_key:
                 newproc.append(
                     sent.replace(
-                        sent,
-                        '<span style="color:{}">{}</span>'.format(color,
-                                                                  sent)))
+                        sent, '<span style="color:{}">{}</span>'.format(color, sent)
+                    )
+                )
             else:
                 newproc.append(sent)
-        proc = ''.join(newproc)
+        proc = "".join(newproc)
         highlight_proc.append(proc)
     return highlight_proc
 
-
     # find similar words in doc embedding
+
+
 def find_similar_words(words, doc, threshold_key=0.5, top_n=3):
     # compute similarity
     similarities = {}
@@ -117,21 +49,21 @@ def find_similar_words(words, doc, threshold_key=0.5, top_n=3):
     # sort
     topk = lambda x: {
         k: v
-        for k, v in sorted(similarities[x].items(),
-                           key=lambda item: item[1],
-                           reverse=True)[:top_n]
+        for k, v in sorted(
+            similarities[x].items(), key=lambda item: item[1], reverse=True
+        )[:top_n]
     }
     result = {word: topk(word) for word in words}
     # filter by threshold
     result_filter = {
-        word: {k: v
-               for k, v in result[word].items() if v >= threshold_key}
+        word: {k: v for k, v in result[word].items() if v >= threshold_key}
         for word in result
     }
     return result_filter
 
-
     # get ent label and text using spacy
+
+
 def get_ent_words(text):
     doc = nlp(text)
 
@@ -142,18 +74,9 @@ def get_ent_words(text):
         textls.append(ent.text)
 
     # combine labels and text into df ordered by labels
-    df = pd.DataFrame({'Category': labels, 'Text': textls})
-    df = df.sort_values(by='Category')
+    df = pd.DataFrame({"Category": labels, "Text": textls})
+    df = df.sort_values(by="Category")
     return df
-
-
-def tfidfkeyword(text, top_n=5):
-    text = ' '.join(cut_sentences(text))
-    tags = jieba.analyse.extract_tags(text,
-                                      topK=top_n,
-                                      allowPOS=('ns', 'n', 'nr', 'm', 'ns',
-                                                'nt', 'nz', 't', 'q'))
-    return tags
 
 
 # cut text into words using spacy
@@ -172,16 +95,68 @@ def text2emb(text):
 
 
 # display entities using spacy
-def display_entities(text, key,labels):
+def display_entities(text, key, labels):
     doc = nlp(text)
-    visualize_ner(doc,
-                  labels=labels,
-                #   labels=None,
-                  key=key,
-                  show_table=False,
-                  title=None)
+    visualize_ner(
+        doc,
+        labels=labels,
+        #   labels=None,
+        key=key,
+        show_table=False,
+        title=None,
+    )
 
 
 # get nlp ner labels
 def get_ner_labels():
     return nlp.get_pipe("ner").labels
+
+
+# replace each word in list based on start and end index
+def highlight_word(text_list, start, end, newtxt):
+    new_text_list = newtxt
+    upttxt = []
+    for txt in new_text_list:
+        upttxt.append('<span style="color:red">{}</span>'.format(txt))
+    return text_list[:start] + upttxt + text_list[end:]
+
+
+# convert tuple list to string list
+def tup2list(tupls):
+    strls = [str(x) for x in tupls]
+    text = " ".join(strls)
+    return text
+
+
+# get keyword list using keybert
+def keybert_keywords(text, topn=3):
+    try:
+        url = backendurl + "/getkeywords"
+        payload = {
+            "text": text,
+            "topn": topn,
+        }
+        headers = {}
+        res = requests.post(url, headers=headers, params=payload)
+        result = res.json()
+        keyls = result["keyls"]
+    except Exception as e:
+        print("转换错误: " + str(e))
+        keyls = []
+    return keyls
+
+
+def sent2emb_async(sentences):
+    try:
+        url = backendurl + "/txtsent2emb"
+        payload = {
+            "sentences": sentences,
+        }
+        headers = {}
+        res = requests.post(url, headers=headers, params=payload)
+        result = res.json()
+        embedding = result["embedding"]
+    except Exception as e:
+        print("转换错误: " + str(e))
+        embedding = []
+    return embedding
