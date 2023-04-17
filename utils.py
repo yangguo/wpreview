@@ -1,14 +1,14 @@
 import pandas as pd
 import requests
-import spacy
+# import spacy
 
 # from keybert import KeyBERT
 # from sentence_transformers import SentenceTransformer
-from spacy_streamlit import visualize_ner
+# from spacy_streamlit import visualize_ner
 
 # smodel = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
-nlp = spacy.load("zh_core_web_lg")
+# nlp = spacy.load("zh_core_web_lg")
 # nlp = spacy.load('zh_core_web_trf')
 
 # backendurl = "http://backend.docker:8000"
@@ -95,21 +95,21 @@ def text2emb(text):
 
 
 # display entities using spacy
-def display_entities(text, key, labels):
-    doc = nlp(text)
-    visualize_ner(
-        doc,
-        labels=labels,
-        #   labels=None,
-        key=key,
-        show_table=False,
-        title=None,
-    )
+# def display_entities(text, key, labels):
+#     doc = nlp(text)
+#     visualize_ner(
+#         doc,
+#         labels=labels,
+#         #   labels=None,
+#         key=key,
+#         show_table=False,
+#         title=None,
+#     )
 
 
 # get nlp ner labels
-def get_ner_labels():
-    return nlp.get_pipe("ner").labels
+# def get_ner_labels():
+#     return nlp.get_pipe("ner").labels
 
 
 # replace each word in list based on start and end index

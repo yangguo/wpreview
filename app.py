@@ -5,7 +5,7 @@ import streamlit as st
 
 from checkwp import wpreview
 from gptfuc import gpt_wpreview
-from utils import display_entities, get_ner_labels, highlight_word, tup2list
+from utils import highlight_word, tup2list
 
 
 def main():
@@ -150,9 +150,9 @@ def main():
         st.write("Keyword Threshold:", threshold_key)
         top = st.slider("Keyword Number", min_value=1, max_value=10, value=5)
         # get ner labels
-        ner_labels = get_ner_labels()
+        # ner_labels = get_ner_labels()
         # choose ner label using multi-select
-        ner_label = st.multiselect("Choose NER label", ner_labels, ner_labels)
+        # ner_label = st.multiselect("Choose NER label", ner_labels, ner_labels)
 
         # choose start and end index
         start_idx = st.number_input(
