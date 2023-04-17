@@ -3,9 +3,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from checkwp import wpreview
+# from checkwp import wpreview
 from gptfuc import gpt_wpreview
-from utils import highlight_word, tup2list
+
+# from utils import highlight_word, tup2list
 
 
 def main():
@@ -130,25 +131,25 @@ def main():
 
     with st.sidebar.expander("Parameters"):
         # choose parameters
-        threshold = st.slider(
-            "Sentence Matching Threshold",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.8,
-            key="sentence",
-        )
+        # threshold = st.slider(
+        #     "Sentence Matching Threshold",
+        #     min_value=0.0,
+        #     max_value=1.0,
+        #     value=0.8,
+        #     key="sentence",
+        # )
 
-        st.write("Sentence Threshold:", threshold)
-        threshold_key = st.slider(
-            "Keyword Matching Threshold",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.6,
-            key="key",
-        )
+        # st.write("Sentence Threshold:", threshold)
+        # threshold_key = st.slider(
+        #     "Keyword Matching Threshold",
+        #     min_value=0.0,
+        #     max_value=1.0,
+        #     value=0.6,
+        #     key="key",
+        # )
 
-        st.write("Keyword Threshold:", threshold_key)
-        top = st.slider("Keyword Number", min_value=1, max_value=10, value=5)
+        # st.write("Keyword Threshold:", threshold_key)
+        # top = st.slider("Keyword Number", min_value=1, max_value=10, value=5)
         # get ner labels
         # ner_labels = get_ner_labels()
         # choose ner label using multi-select

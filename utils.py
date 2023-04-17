@@ -1,5 +1,6 @@
-import pandas as pd
+# import pandas as pd
 import requests
+
 # import spacy
 
 # from keybert import KeyBERT
@@ -16,82 +17,82 @@ backendurl = "http://localhost:8000"
 
 
 # replace color of word in text match in word list
-def replace_color(proc_list, proc_keywords, color):
-    highlight_proc = []
-    for proc, proc_key in zip(proc_list, proc_keywords):
-        newproc = []
-        sentls = cut_sentences(proc)
-        # replace sent in proc if match with keyword
-        for sent in sentls:
-            if sent in proc_key:
-                newproc.append(
-                    sent.replace(
-                        sent, '<span style="color:{}">{}</span>'.format(color, sent)
-                    )
-                )
-            else:
-                newproc.append(sent)
-        proc = "".join(newproc)
-        highlight_proc.append(proc)
-    return highlight_proc
+# def replace_color(proc_list, proc_keywords, color):
+#     highlight_proc = []
+#     for proc, proc_key in zip(proc_list, proc_keywords):
+#         newproc = []
+#         sentls = cut_sentences(proc)
+#         # replace sent in proc if match with keyword
+#         for sent in sentls:
+#             if sent in proc_key:
+#                 newproc.append(
+#                     sent.replace(
+#                         sent, '<span style="color:{}">{}</span>'.format(color, sent)
+#                     )
+#                 )
+#             else:
+#                 newproc.append(sent)
+#         proc = "".join(newproc)
+#         highlight_proc.append(proc)
+#     return highlight_proc
 
-    # find similar words in doc embedding
-
-
-def find_similar_words(words, doc, threshold_key=0.5, top_n=3):
-    # compute similarity
-    similarities = {}
-    for word in words:
-        tok = nlp(word)
-        similarities[tok.text] = {}
-        for tok_ in doc:
-            similarities[tok.text].update({tok_.text: tok.similarity(tok_)})
-    # sort
-    topk = lambda x: {
-        k: v
-        for k, v in sorted(
-            similarities[x].items(), key=lambda item: item[1], reverse=True
-        )[:top_n]
-    }
-    result = {word: topk(word) for word in words}
-    # filter by threshold
-    result_filter = {
-        word: {k: v for k, v in result[word].items() if v >= threshold_key}
-        for word in result
-    }
-    return result_filter
-
-    # get ent label and text using spacy
+# find similar words in doc embedding
 
 
-def get_ent_words(text):
-    doc = nlp(text)
+# def find_similar_words(words, doc, threshold_key=0.5, top_n=3):
+#     # compute similarity
+#     similarities = {}
+#     for word in words:
+#         tok = nlp(word)
+#         similarities[tok.text] = {}
+#         for tok_ in doc:
+#             similarities[tok.text].update({tok_.text: tok.similarity(tok_)})
+#     # sort
+#     topk = lambda x: {
+#         k: v
+#         for k, v in sorted(
+#             similarities[x].items(), key=lambda item: item[1], reverse=True
+#         )[:top_n]
+#     }
+#     result = {word: topk(word) for word in words}
+#     # filter by threshold
+#     result_filter = {
+#         word: {k: v for k, v in result[word].items() if v >= threshold_key}
+#         for word in result
+#     }
+#     return result_filter
 
-    labels = []
-    textls = []
-    for ent in doc.ents:
-        labels.append(ent.label_)
-        textls.append(ent.text)
-
-    # combine labels and text into df ordered by labels
-    df = pd.DataFrame({"Category": labels, "Text": textls})
-    df = df.sort_values(by="Category")
-    return df
+# get ent label and text using spacy
 
 
-# cut text into words using spacy
-def cut_sentences(text):
-    # cut text into words
-    doc = nlp(text)
-    sents = [t.text for t in doc]
-    return sents
+# def get_ent_words(text):
+#     doc = nlp(text)
+
+#     labels = []
+#     textls = []
+#     for ent in doc.ents:
+#         labels.append(ent.label_)
+#         textls.append(ent.text)
+
+#     # combine labels and text into df ordered by labels
+#     df = pd.DataFrame({"Category": labels, "Text": textls})
+#     df = df.sort_values(by="Category")
+#     return df
 
 
-# convert text spacy to word embedding
-def text2emb(text):
-    # cut text into words
-    doc = nlp(text)
-    return doc
+# # cut text into words using spacy
+# def cut_sentences(text):
+#     # cut text into words
+#     doc = nlp(text)
+#     sents = [t.text for t in doc]
+#     return sents
+
+
+# # convert text spacy to word embedding
+# def text2emb(text):
+#     # cut text into words
+#     doc = nlp(text)
+#     return doc
 
 
 # display entities using spacy

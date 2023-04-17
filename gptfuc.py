@@ -198,7 +198,7 @@ def gpt_wpreview(audit_requirement, audit_procedure, model_name="gpt-3.5-turbo")
         [system_message_prompt, human_message_prompt]
     )
 
-    chat = ChatOpenAI(model_name=model_name)
+    chat = ChatOpenAI(model_name=model_name, temperature=0)
 
     chain = LLMChain(llm=chat, prompt=chat_prompt)
     response = chain.run(
