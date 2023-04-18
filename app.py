@@ -154,6 +154,8 @@ def main():
         # ner_labels = get_ner_labels()
         # choose ner label using multi-select
         # ner_label = st.multiselect("Choose NER label", ner_labels, ner_labels)
+        # choose model
+        model_name = st.selectbox("选择模型", ["gpt-3.5-turbo", "gpt-4"])
 
         # choose start and end index
         start_idx = st.number_input(
@@ -207,7 +209,7 @@ def main():
                 #     errorls,
                 # ) = wpreview(proc_batch, audit_batch, threshold, threshold_key, top)
                 verification_result, modified_audit_procedure = gpt_wpreview(
-                    proc_batch, audit_batch
+                    proc_batch, audit_batch, model_name
                 )
 
                 st.write(verification_result)
