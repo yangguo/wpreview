@@ -118,7 +118,7 @@ def main():
     audit_len = len(audit_list)
 
     # if proc_list or audit_list is empty or not equal
-    if proc_len == 0 or audit_len == 0 or proc_len != audit_len:
+    if proc_len == 0 or audit_len == 0:
         st.error("Procedure and Testing list must be equal and not empty")
         st.error(
             "(Testing Procedure:"

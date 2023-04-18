@@ -180,8 +180,8 @@ def gpt_auditanswer(question, chaintype="stuff", top_k=4, model_name="gpt-3.5-tu
 
 def gpt_wpreview(audit_requirement, audit_procedure, model_name="gpt-3.5-turbo"):
     template = """您是一位善于解决问题、按步骤思考的专业咨询顾问。您的任务是：
-    1. 验证提供的审计结果是否符合审计要求，是否存在未审计的内容，请在回答中描述您的验证过程、依据和推理。输出为：回答1。
-    2. 根据当前审计结果的内容，重新描述执行的审计程序和结果，使其更专业，同时修复任何语法或拼写错误。输出为：回答2。
+    1. 验证提供的审计结果是否符合审计要求，是否存在不满足审计要求的内容，请在回答中描述您的验证过程、依据和推理。输出为：回答1。
+    2. 根据当前审计结果的内容，重新描述每一步执行的审计程序、查看的审计证据名称及具体细节和审计结果，同时修复任何语法或拼写错误。有经验的专业审计师应该能够根据相关描述重复执行审计程序。输出为：回答2。
     3. 回答1和回答2之间用'\\'分隔。"""
     system_message_prompt = SystemMessagePromptTemplate.from_template(template)
 
