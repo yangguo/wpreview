@@ -36,6 +36,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+AZURE_BASE_URL = os.environ.get("AZURE_BASE_URL")
+AZURE_API_KEY = os.environ.get("AZURE_API_KEY")
+AZURE_DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME")
+
+COHERE_API_KEY=os.environ.get("COHERE_API_KEY")
+HF_API_TOKEN=os.environ.get("HF_API_TOKEN")
+
+
 # from qdrant_client import QdrantClient
 model_name = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 # embeddings =HuggingFaceEmbeddings(model_name=model_name)
@@ -44,7 +52,7 @@ model_name = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 embeddings = HuggingFaceHubEmbeddings(
     repo_id=model_name,
     task="feature-extraction",
-    huggingfacehub_api_token="***REMOVED***",
+    huggingfacehub_api_token=HF_API_TOKEN,
 )
 
 
@@ -54,11 +62,6 @@ fileidxfolder = "fileidx"
 backendurl = "http://localhost:8000"
 
 
-AZURE_BASE_URL = os.environ.get("AZURE_BASE_URL")
-AZURE_API_KEY = os.environ.get("AZURE_API_KEY")
-AZURE_DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME")
-
-COHERE_API_KEY=os.environ.get("COHERE_API_KEY")
 
 import openai
 # openai.api_base="https://tiny-shadow-5144.vixt.workers.dev/v1"
@@ -181,9 +184,9 @@ def gpt_wpreview(audit_requirement, audit_procedure, model_name="gpt-3.5-turbo")
     template = """
     您是一位专业咨询顾问，善于解决问题并按步骤思考。请完成以下任务：
     1. 仔细阅读并分析提供的审计要求和审计结果。
-    2. 验证审计结果是否符合审计要求。如有不符合的内容，请提供您的验证过程、依据和推理。将这部分回答称为“回答1”。
-    3. 重新描述审计程序的每个步骤，包括审计证据的名称和具体细节，以及审计结果。同时修复任何语法或拼写错误。确保经验丰富的审计师能够根据描述重复执行审计程序。将这部分回答称为“回答2”。
-    4. 用'\\'将回答1和回答2分隔开。
+    2. 验证审计结果是否符合审计要求。如有不符合的内容，请提供您的验证过程、依据和推理。将这部分回答称为"回答1"。
+    3. 重新描述审计程序的每个步骤，以清单形式列出每个步骤的审计过程和审计结果，并引用审计程序的具体内容，确保经验丰富的审计师能够根据描述重复执行审计程序并得到相同的结果。同时修复任何语法或拼写错误。将这部分回答称为"回答2"。
+    4. 请以 JSON 格式提供您的回答，格式如下： {{"错误检查": "回答1的具体内容", "更新结果": "回答2的具体内容"}}。
     """
     system_message_prompt = SystemMessagePromptTemplate.from_template(template)
 
@@ -194,6 +197,7 @@ def gpt_wpreview(audit_requirement, audit_procedure, model_name="gpt-3.5-turbo")
     审计结果：
     {audit_procedure}
     """
+
     human_message_prompt = HumanMessagePromptTemplate.from_template(human_template)
 
     chat_prompt = ChatPromptTemplate.from_messages(
@@ -206,13 +210,15 @@ def gpt_wpreview(audit_requirement, audit_procedure, model_name="gpt-3.5-turbo")
     response = chain.run(
         audit_requirement=audit_requirement, audit_procedure=audit_procedure
     )
+    # return response
+   
+    # load json response
+    response_json = json.loads(response)
 
-    output_text = response.strip()
-
-    # Split the output text into verification result and modified audit procedure
-    output_parts = output_text.split("\\")
-    verification_result = output_parts[0].strip()
-    modified_audit_procedure = "\n".join(output_parts[1:]).strip()
+    # get verification result
+    verification_result = response_json["错误检查"]
+    # get modified audit procedure
+    modified_audit_procedure = response_json["更新结果"]
 
     return verification_result, modified_audit_procedure
 

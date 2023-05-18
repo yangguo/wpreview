@@ -208,11 +208,14 @@ def main():
                 #     proc_keywords,
                 #     errorls,
                 # ) = wpreview(proc_batch, audit_batch, threshold, threshold_key, top)
+                # response = gpt_wpreview(proc_batch, audit_batch, model_name)
+                # st.write(response)
                 verification_result, modified_audit_procedure = gpt_wpreview(
                     proc_batch, audit_batch, model_name
                 )
-
+                st.markdown("#### 错误检查")
                 st.write(verification_result)
+                st.markdown("#### 更新结果")
                 st.write(modified_audit_procedure)
                 # display the result
                 # st.write(dfsty)
