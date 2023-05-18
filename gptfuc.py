@@ -32,8 +32,9 @@ from langchain.text_splitter import (
 )
 from langchain.vectorstores import FAISS, Chroma, Pinecone, Qdrant
 
-# import pinecone
+from dotenv import load_dotenv
 
+load_dotenv()
 
 # from qdrant_client import QdrantClient
 model_name = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
@@ -46,42 +47,40 @@ embeddings = HuggingFaceHubEmbeddings(
     huggingfacehub_api_token="***REMOVED***",
 )
 
-# read config from config.json
-with open("config.json", "r") as f:
-    config = json.load(f)
-
-# get openai api key from config.json
-api_key = config["openai_api_key"]
-
-PINECONE_API_KEY = "***REMOVED***"
-PINECONE_API_ENV = "us-west1-gcp"
-
-# initialize pinecone
-# pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_API_ENV)
-
-
-qdrant_host = "127.0.0.1"
-# qdrant_api_key = ""
-
-
-os.environ["OPENAI_API_KEY"] = api_key
 
 uploadfolder = "uploads"
 filerawfolder = "fileraw"
 fileidxfolder = "fileidx"
 backendurl = "http://localhost:8000"
 
-# openai_api_key = os.environ.get("OPENAI_API_KEY")
-# if openai_api_key is None:
-#     print("请设置OPENAI_API_KEY")
-# else:
-#     print("已设置OPENAI_API_KEY" + openai_api_key)
 
-# initialize pinecone
-# pinecone.init(
-#     api_key=PINECONE_API_KEY,
-#     environment=PINECONE_API_ENV
+AZURE_BASE_URL = os.environ.get("AZURE_BASE_URL")
+AZURE_API_KEY = os.environ.get("AZURE_API_KEY")
+AZURE_DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME")
+
+COHERE_API_KEY=os.environ.get("COHERE_API_KEY")
+
+import openai
+# openai.api_base="https://tiny-shadow-5144.vixt.workers.dev/v1"
+# openai.api_base="https://super-heart-4116.vixt.workers.dev/v1"
+openai.api_base="https://az.139105.xyz/v1"
+
+# llm = ChatOpenAI(model_name=model_name )
+llm = ChatOpenAI(model_name="gpt-3.5-turbo", openai_api_key=AZURE_API_KEY ) 
+                    
+
+# use azure model
+#     llm = AzureChatOpenAI(
+#     openai_api_base=AZURE_BASE_URL,
+#     openai_api_version="2023-03-15-preview",
+#     deployment_name=AZURE_DEPLOYMENT_NAME,
+#     openai_api_key=AZURE_API_KEY,
+#     openai_api_type = "azure",
 # )
+# use cohere model
+# llm = Cohere(model="command-xlarge-nightly",cohere_api_key=COHERE_API_KEY,temperature=0)
+
+
 
 
 def gpt_vectoranswer(question, chaintype="stuff", top_k=4, model_name="gpt-3.5-turbo"):
@@ -201,9 +200,9 @@ def gpt_wpreview(audit_requirement, audit_procedure, model_name="gpt-3.5-turbo")
         [system_message_prompt, human_message_prompt]
     )
 
-    chat = ChatOpenAI(model_name=model_name, temperature=0)
+    # chat = ChatOpenAI(model_name=model_name, temperature=0)
 
-    chain = LLMChain(llm=chat, prompt=chat_prompt)
+    chain = LLMChain(llm=llm, prompt=chat_prompt)
     response = chain.run(
         audit_requirement=audit_requirement, audit_procedure=audit_procedure
     )
