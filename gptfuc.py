@@ -32,6 +32,8 @@ from langchain.text_splitter import (
 )
 from langchain.vectorstores import FAISS, Chroma, Pinecone, Qdrant
 
+from langchain.output_parsers import StructuredOutputParser, ResponseSchema,RetryWithErrorOutputParser
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -181,12 +183,22 @@ def gpt_auditanswer(question, chaintype="stuff", top_k=4, model_name="gpt-3.5-tu
 
 
 def gpt_wpreview(audit_requirement, audit_procedure, model_name="gpt-3.5-turbo"):
+
+    response_schemas = [
+        ResponseSchema(name="错误检查", description="回答1的具体内容"),
+        ResponseSchema(name="更新结果", description="回答2的具体内容")
+    ]
+    output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
+
+    format_instructions = output_parser.get_format_instructions()
+
     template = """
     您是一位专业咨询顾问，善于解决问题并按步骤思考。请完成以下任务：
     1. 仔细阅读并分析提供的审计要求和审计结果。
     2. 验证审计结果是否符合审计要求。如有不符合的内容，请提供您的验证过程、依据和推理。将这部分回答称为"回答1"。
     3. 重新描述审计程序的每个步骤，以清单形式列出每个步骤的审计过程和审计结果，并引用审计程序的具体内容，确保经验丰富的审计师能够根据描述重复执行审计程序并得到相同的结果。同时修复任何语法或拼写错误。将这部分回答称为"回答2"。
-    4. 请以 JSON 格式提供您的回答，格式如下： {{"错误检查": "回答1的具体内容", "更新结果": "回答2的具体内容"}}。
+    
+    {format_instructions}
     """
     system_message_prompt = SystemMessagePromptTemplate.from_template(template)
 
@@ -200,8 +212,10 @@ def gpt_wpreview(audit_requirement, audit_procedure, model_name="gpt-3.5-turbo")
 
     human_message_prompt = HumanMessagePromptTemplate.from_template(human_template)
 
-    chat_prompt = ChatPromptTemplate.from_messages(
-        [system_message_prompt, human_message_prompt]
+    chat_prompt = ChatPromptTemplate(
+        messages=[system_message_prompt, human_message_prompt],
+        input_variables=["audit_requirement","audit_procedure"],
+    partial_variables={"format_instructions": format_instructions}
     )
 
     # chat = ChatOpenAI(model_name=model_name, temperature=0)
@@ -211,9 +225,12 @@ def gpt_wpreview(audit_requirement, audit_procedure, model_name="gpt-3.5-turbo")
         audit_requirement=audit_requirement, audit_procedure=audit_procedure
     )
     # return response
-   
+    # print(response)
+
+    response_json=output_parser.parse(response)
+    # print(response_json)
     # load json response
-    response_json = json.loads(response)
+    # response_json = json.loads(resp)
 
     # get verification result
     verification_result = response_json["错误检查"]

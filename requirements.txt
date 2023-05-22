@@ -4,3 +4,4 @@ langchain
 huggingface_hub
 python-dotenv
 openai
+openpyxl
