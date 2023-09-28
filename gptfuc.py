@@ -3,12 +3,15 @@ import os
 
 # import faiss
 import pandas as pd
+from dotenv import load_dotenv
 from langchain import LLMChain
 
 # from gpt_index import GPTSimpleVectorIndex, LLMPredictor, SimpleDirectoryReader
 from langchain.chains import RetrievalQA, VectorDBQA
 from langchain.chains.question_answering import load_qa_chain
-from langchain.chat_models import ChatOpenAI
+
+# from langchain.indexes import VectorstoreIndexCreator
+from langchain.chat_models import AzureChatOpenAI, ChatOpenAI
 
 # from langchain.document_loaders import TextLoader
 from langchain.document_loaders import DirectoryLoader
@@ -17,9 +20,11 @@ from langchain.embeddings import (
     HuggingFaceHubEmbeddings,
     OpenAIEmbeddings,
 )
-
-# from langchain.indexes import VectorstoreIndexCreator
-from langchain.llms import OpenAIChat
+from langchain.output_parsers import (
+    ResponseSchema,
+    RetryWithErrorOutputParser,
+    StructuredOutputParser,
+)
 from langchain.prompts.chat import (
     AIMessagePromptTemplate,
     ChatPromptTemplate,
@@ -32,18 +37,18 @@ from langchain.text_splitter import (
 )
 from langchain.vectorstores import FAISS, Chroma, Pinecone, Qdrant
 
-from langchain.output_parsers import StructuredOutputParser, ResponseSchema,RetryWithErrorOutputParser
-
-from dotenv import load_dotenv
-
 load_dotenv()
 
 AZURE_BASE_URL = os.environ.get("AZURE_BASE_URL")
+AZURE_BASE_URL = os.environ.get("AZURE_BASE_URL")
 AZURE_API_KEY = os.environ.get("AZURE_API_KEY")
 AZURE_DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME")
+AZURE_DEPLOYMENT_NAME_16K = os.environ.get("AZURE_DEPLOYMENT_NAME_16K")
+AZURE_DEPLOYMENT_NAME_GPT4 = os.environ.get("AZURE_DEPLOYMENT_NAME_GPT4")
+AZURE_DEPLOYMENT_NAME_GPT4_32K = os.environ.get("AZURE_DEPLOYMENT_NAME_GPT4_32K")
 
-COHERE_API_KEY=os.environ.get("COHERE_API_KEY")
-HF_API_TOKEN=os.environ.get("HF_API_TOKEN")
+COHERE_API_KEY = os.environ.get("COHERE_API_KEY")
+HF_API_TOKEN = os.environ.get("HF_API_TOKEN")
 
 
 # from qdrant_client import QdrantClient
@@ -64,15 +69,14 @@ fileidxfolder = "fileidx"
 backendurl = "http://localhost:8000"
 
 
-
-import openai
+# import openai
 # openai.api_base="https://tiny-shadow-5144.vixt.workers.dev/v1"
 # openai.api_base="https://super-heart-4116.vixt.workers.dev/v1"
-openai.api_base="https://az.139105.xyz/v1"
+# openai.api_base="https://az.139105.xyz/v1"
 
 # llm = ChatOpenAI(model_name=model_name )
-llm = ChatOpenAI(model_name="gpt-3.5-turbo", openai_api_key=AZURE_API_KEY ) 
-                    
+# llm = ChatOpenAI(model_name="gpt-3.5-turbo", openai_api_key=AZURE_API_KEY )
+
 
 # use azure model
 #     llm = AzureChatOpenAI(
@@ -85,7 +89,25 @@ llm = ChatOpenAI(model_name="gpt-3.5-turbo", openai_api_key=AZURE_API_KEY )
 # use cohere model
 # llm = Cohere(model="command-xlarge-nightly",cohere_api_key=COHERE_API_KEY,temperature=0)
 
+# convert gpt model name to azure deployment name
+gpt_to_deployment = {
+    "gpt-35-turbo": AZURE_DEPLOYMENT_NAME,
+    "gpt-35-turbo-16k": AZURE_DEPLOYMENT_NAME_16K,
+    "gpt-4": AZURE_DEPLOYMENT_NAME_GPT4,
+    "gpt-4-32k": AZURE_DEPLOYMENT_NAME_GPT4_32K,
+}
 
+# use azure llm based on model name
+def get_azurellm(model_name):
+    deployment_name = gpt_to_deployment[model_name]
+    llm = AzureChatOpenAI(
+        openai_api_base=AZURE_BASE_URL,
+        openai_api_version="2023-07-01-preview",
+        deployment_name=deployment_name,
+        openai_api_key=AZURE_API_KEY,
+        openai_api_type="azure",
+    )
+    return llm
 
 
 def gpt_vectoranswer(question, chaintype="stuff", top_k=4, model_name="gpt-3.5-turbo"):
@@ -182,11 +204,11 @@ def gpt_auditanswer(question, chaintype="stuff", top_k=4, model_name="gpt-3.5-tu
     return answer, sourcedf
 
 
-def gpt_wpreview(audit_requirement, audit_procedure, model_name="gpt-3.5-turbo"):
+def gpt_wpreview(audit_requirement, audit_procedure, model_name="gpt-35-turbo"):
 
     response_schemas = [
         ResponseSchema(name="错误检查", description="回答1的具体内容"),
-        ResponseSchema(name="更新结果", description="回答2的具体内容")
+        ResponseSchema(name="更新结果", description="回答2的具体内容"),
     ]
     output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
 
@@ -214,11 +236,11 @@ def gpt_wpreview(audit_requirement, audit_procedure, model_name="gpt-3.5-turbo")
 
     chat_prompt = ChatPromptTemplate(
         messages=[system_message_prompt, human_message_prompt],
-        input_variables=["audit_requirement","audit_procedure"],
-    partial_variables={"format_instructions": format_instructions}
+        input_variables=["audit_requirement", "audit_procedure"],
+        partial_variables={"format_instructions": format_instructions},
     )
 
-    # chat = ChatOpenAI(model_name=model_name, temperature=0)
+    llm = get_azurellm(model_name)
 
     chain = LLMChain(llm=llm, prompt=chat_prompt)
     response = chain.run(
@@ -227,7 +249,14 @@ def gpt_wpreview(audit_requirement, audit_procedure, model_name="gpt-3.5-turbo")
     # return response
     # print(response)
 
-    response_json=output_parser.parse(response)
+    retry_parser = RetryWithErrorOutputParser.from_llm(parser=output_parser, llm=llm)
+
+    try:
+        response_json = output_parser.parse(response)
+    except Exception as e:
+        print(e)
+        response_json = retry_parser.parse_with_prompt(response, chat_prompt)
+
     # print(response_json)
     # load json response
     # response_json = json.loads(resp)

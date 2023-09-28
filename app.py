@@ -18,12 +18,16 @@ def main():
         proc_text = st.text_area("Testing Procedures")
         audit_text = st.text_area("Testing Descriptions")
 
-        proc_list = proc_text.split("/")
+        proc_list = [proc_text]
         # filter blank item
-        proc_list = list(filter(lambda item: item.strip(), proc_list))
-        audit_list = audit_text.split("/")
+        # proc_list = list(filter(lambda item: item.strip(), proc_list))
+        audit_list = [audit_text]
         # filter blank item
-        audit_list = list(filter(lambda item: item.strip(), audit_list))
+        # audit_list = list(filter(lambda item: item.strip(), audit_list))
+
+        if proc_text == "" or audit_text == "":
+            st.error("Procedure and Testing must not empty")
+            return
 
     elif input_method == "Upload File":
         # upload file
@@ -119,43 +123,20 @@ def main():
 
     # if proc_list or audit_list is empty or not equal
     if proc_len == 0 or audit_len == 0:
-        st.error("Procedure and Testing list must be equal and not empty")
-        st.error(
-            "(Testing Procedure:"
-            + str(len(proc_list))
-            + "/ Testing Description:"
-            + str(len(audit_list))
-            + ")"
-        )
+        st.error("Procedure and Testing must not empty")
+        # st.error(
+        #     "(Testing Procedure:"
+        #     + str(len(proc_list))
+        #     + "/ Testing Description:"
+        #     + str(len(audit_list))
+        #     + ")"
+        # )
         return
 
     with st.sidebar.expander("Parameters"):
-        # choose parameters
-        # threshold = st.slider(
-        #     "Sentence Matching Threshold",
-        #     min_value=0.0,
-        #     max_value=1.0,
-        #     value=0.8,
-        #     key="sentence",
-        # )
-
-        # st.write("Sentence Threshold:", threshold)
-        # threshold_key = st.slider(
-        #     "Keyword Matching Threshold",
-        #     min_value=0.0,
-        #     max_value=1.0,
-        #     value=0.6,
-        #     key="key",
-        # )
-
-        # st.write("Keyword Threshold:", threshold_key)
-        # top = st.slider("Keyword Number", min_value=1, max_value=10, value=5)
-        # get ner labels
-        # ner_labels = get_ner_labels()
-        # choose ner label using multi-select
-        # ner_label = st.multiselect("Choose NER label", ner_labels, ner_labels)
-        # choose model
-        model_name = st.selectbox("选择模型", ["gpt-3.5-turbo", "gpt-4"])
+        model_name = st.sidebar.selectbox(
+            "选择模型", ["gpt-35-turbo", "gpt-35-turbo-16k", "gpt-4", "gpt-4-32k"]
+        )
 
         # choose start and end index
         start_idx = st.number_input(
