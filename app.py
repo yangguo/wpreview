@@ -12,11 +12,11 @@ from gptfuc import gpt_wpreview
 def main():
 
     # choose input method of manual or upload file
-    input_method = st.sidebar.radio("Input Method", ("Manual", "Upload File"))
+    input_method = st.sidebar.radio("输入方式", ("单一", "上传文件"))
 
-    if input_method == "Manual":
-        proc_text = st.text_area("Testing Procedures")
-        audit_text = st.text_area("Testing Descriptions")
+    if input_method == "单一":
+        proc_text = st.text_area("审计要求")
+        audit_text = st.text_area("审计结果")
 
         proc_list = [proc_text]
         # filter blank item
@@ -26,12 +26,12 @@ def main():
         # audit_list = list(filter(lambda item: item.strip(), audit_list))
 
         if proc_text == "" or audit_text == "":
-            st.error("Procedure and Testing must not empty")
+            st.error("审计要求和审计结果不能为空")
             return
 
-    elif input_method == "Upload File":
+    elif input_method == "上传文件":
         # upload file
-        upload_file = st.file_uploader("Upload workpaper", type=["xlsx", "docx"])
+        upload_file = st.file_uploader("上传底稿", type=["xlsx", "docx"])
         if upload_file is not None:
             # if upload file is xlsx
             if (
@@ -113,7 +113,7 @@ def main():
                     proc_list = []
                     audit_list = []
         else:
-            st.error("No file selected")
+            st.error("Please upload file")
             proc_list = []
             audit_list = []
 
@@ -123,38 +123,44 @@ def main():
 
     # if proc_list or audit_list is empty or not equal
     if proc_len == 0 or audit_len == 0:
-        st.error("Procedure and Testing must not empty")
-        # st.error(
-        #     "(Testing Procedure:"
-        #     + str(len(proc_list))
-        #     + "/ Testing Description:"
-        #     + str(len(audit_list))
-        #     + ")"
-        # )
+        st.error("审计要求和审计结果不能为空")
         return
 
-    with st.sidebar.expander("Parameters"):
-        model_name = st.sidebar.selectbox(
-            "选择模型", ["gpt-35-turbo", "gpt-35-turbo-16k", "gpt-4", "gpt-4-32k"]
-        )
+    # choose model
+    model_name = st.sidebar.selectbox(
+        "选择模型",
+        [
+            "gpt-35-turbo",
+            "gpt-35-turbo-16k",
+            "gpt-4",
+            "gpt-4-32k",
+            "gpt-4-turbo",
+            "tongyi",
+            "ERNIE-Bot-4",
+            "ERNIE-Bot-turbo",
+            "ChatGLM2-6B-32K",
+            "Yi-34B-Chat",
+            "gemini-pro",
+        ],
+    )
 
-        # choose start and end index
-        start_idx = st.number_input(
-            "Choose start index", min_value=0, max_value=proc_len - 1, value=0
-        )
-        # convert start_idx to int
-        start_idx = int(start_idx)
-        end_idx = st.number_input(
-            "Choose end index",
-            min_value=start_idx,
-            max_value=proc_len - 1,
-            value=proc_len - 1,
-        )
-        # convert end_idx to int
-        end_idx = int(end_idx)
-        # get proc_list and audit_list
-        subproc_list = proc_list[start_idx : end_idx + 1]
-        subaudit_list = audit_list[start_idx : end_idx + 1]
+    # choose start and end index
+    start_idx = st.sidebar.number_input(
+        "Choose start index", min_value=0, max_value=proc_len - 1, value=0
+    )
+    # convert start_idx to int
+    start_idx = int(start_idx)
+    end_idx = st.sidebar.number_input(
+        "Choose end index",
+        min_value=start_idx,
+        max_value=proc_len - 1,
+        value=proc_len - 1,
+    )
+    # convert end_idx to int
+    end_idx = int(end_idx)
+    # get proc_list and audit_list
+    subproc_list = proc_list[start_idx : end_idx + 1]
+    subaudit_list = audit_list[start_idx : end_idx + 1]
 
     search = st.sidebar.button("Review")
 
@@ -191,13 +197,15 @@ def main():
                 # ) = wpreview(proc_batch, audit_batch, threshold, threshold_key, top)
                 # response = gpt_wpreview(proc_batch, audit_batch, model_name)
                 # st.write(response)
-                verification_result, modified_audit_procedure = gpt_wpreview(
-                    proc_batch, audit_batch, model_name
-                )
-                st.markdown("#### 错误检查")
-                st.write(verification_result)
-                st.markdown("#### 更新结果")
-                st.write(modified_audit_procedure)
+                result = gpt_wpreview(proc_batch, audit_batch, model_name)
+                # get verification result
+                st.markdown("#### 审阅结果")
+                st.write(result)
+
+                # st.markdown("#### 错误检查")
+                # st.write(verification_result)
+                # st.markdown("#### 更新结果")
+                # st.write(modified_audit_procedure)
                 # display the result
                 # st.write(dfsty)
 
@@ -269,8 +277,8 @@ def main():
                     {
                         "proc": proc_batch,
                         "audit": audit_batch,
-                        "result": verification_result,
-                        "modified_audit_procedure": modified_audit_procedure,
+                        "result": result,
+                        # "modified_audit_procedure": modified_audit_procedure,
                     }
                 )
 
