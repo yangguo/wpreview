@@ -60,7 +60,6 @@ class MockClient:
 
 
 # Monkey patch the Azure OpenAI client
-import sys
 from unittest.mock import MagicMock
 
 sys.modules['openai'] = MagicMock()

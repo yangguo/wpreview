@@ -129,7 +129,7 @@ class ExcelImageReviewer:
             title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
             header_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 12)
             cell_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
-        except:
+        except (IOError, OSError):
             title_font = ImageFont.load_default()
             header_font = ImageFont.load_default()
             cell_font = ImageFont.load_default()
