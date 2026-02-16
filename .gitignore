@@ -140,3 +140,7 @@ dmypy.json
 .markdownlint.yaml
 
 *.json
+
+# Excel review output
+output/
+sample_data.xlsx

@@ -5,3 +5,6 @@ huggingface_hub
 python-dotenv
 openai
 openpyxl
+pillow
+pandas
+matplotlib
