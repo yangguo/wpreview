@@ -59,10 +59,11 @@ class MockClient:
         self.chat = type('obj', (object,), {'completions': MockChatCompletions()})()
 
 
-# Monkey patch the Azure OpenAI client
+# Monkey patch the OpenAI client used by excel_image_review.py
 from unittest.mock import MagicMock
 
 sys.modules['openai'] = MagicMock()
+sys.modules['openai'].OpenAI = MockClient
 sys.modules['openai'].AzureOpenAI = MockClient
 
 
@@ -108,17 +109,21 @@ def test_excel_review():
     print("="*60)
     
     # Check images
+    assert reviewer.sheet_images, "No sheet images were generated"
     for sheet_name, image_path in reviewer.sheet_images.items():
         if os.path.exists(image_path):
             size = os.path.getsize(image_path)
             print(f"✓ Image for '{sheet_name}': {image_path} ({size} bytes)")
+            assert size > 0, f"Generated image for '{sheet_name}' is empty"
         else:
             print(f"✗ Image for '{sheet_name}' not found!")
+            assert False, f"Image for '{sheet_name}' was not created"
     
     # Check report
     if os.path.exists(report_path):
         size = os.path.getsize(report_path)
         print(f"✓ Report: {report_path} ({size} bytes)")
+        assert size > 0, "Generated report file is empty"
         
         # Show a preview of the report
         print("\nReport Preview (first 500 chars):")
@@ -128,9 +133,13 @@ def test_excel_review():
             print("...")
     else:
         print(f"✗ Report not found!")
+        assert False, "Report file was not created"
     
     # Check reviews
     print(f"\n✓ Total reviews generated: {len(reviewer.sheet_reviews)}")
+    assert reviewer.sheet_reviews, "No reviews were generated"
+    for sheet_name, review_text in reviewer.sheet_reviews.items():
+        assert "Enginering" in review_text, f"Mock review text missing for '{sheet_name}'"
     
     print("\n" + "="*60)
     print("✅ Test completed successfully!")

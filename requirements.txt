@@ -1,10 +1,6 @@
-streamlit
-python-docx
-langchain
-huggingface_hub
 python-dotenv
 openai
 openpyxl
 pillow
 pandas
-matplotlib
+pdf2image
