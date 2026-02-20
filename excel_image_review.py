@@ -5,6 +5,7 @@ import argparse
 import base64
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,8 +17,12 @@ import pandas as pd
 from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import Image, ImageDraw, ImageFont
+from bs4 import BeautifulSoup, NavigableString, Tag
+from docx import Document
+from docx.shared import Inches
 import openpyxl
 from openpyxl.utils import get_column_letter
+import markdown
 
 load_dotenv()
 
@@ -105,11 +110,23 @@ class ExcelImageReviewer:
             return ImageFont.load_default()
 
         bold_candidates = [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/System/Library/Fonts/Supplemental/Songti.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
             "/Library/Fonts/Arial Bold.ttf",
         ]
         reg_candidates = [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/System/Library/Fonts/Supplemental/Songti.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/System/Library/Fonts/Supplemental/Arial.ttf",
             "/Library/Fonts/Arial.ttf",
@@ -143,14 +160,27 @@ class ExcelImageReviewer:
         img_base64 = base64.b64encode(buffered.getvalue()).decode()
 
         prompt = (
-            f"You are a professional data quality reviewer. Carefully review this "
-            f"spreadsheet image (sheet: {sheet_name}) and provide a detailed analysis covering:\n\n"
-            "1. **Spelling and Grammar**: Misspellings, typos, or grammatical errors in headers or data.\n"
-            "2. **Logical Consistency**: Illogical dates, out-of-range numbers, inconsistent categorizations.\n"
-            "3. **Data Quality**: Missing data, duplicates, inconsistent formatting.\n"
-            "4. **Structural Issues**: Inconsistent headers, problematic merged cells, unnecessary empty rows/columns.\n"
-            "5. **Suggestions**: Specific, actionable recommendations.\n\n"
-            "Provide your review in a structured format with clear sections and specific examples."
+            f"你是IT审计与数据质量双领域审阅专家。请审阅该电子表格截图（sheet: {sheet_name}），"
+            "仅使用中文输出标准 Markdown。\n\n"
+            "目标：直接给出问题，定位到具体语句并给出可执行修改，不要写笼统总结。\n\n"
+            "请按以下固定结构输出：\n"
+            "## 一、逐条问题定位与整改意见\n"
+            "- 仅列出有问题项，最多10条，按高/中/低排序。\n"
+            "- 每条必须包含：具体位置（如表名+单元格/行列描述）、原文、问题说明、修改为、优先级。\n"
+            "- 必须指出具体哪句话有问题，不能只做概括。\n"
+            "- 不要写影响，不要写背景。\n\n"
+            "## 二、审计程序要求符合性\n"
+            "- 判断测试过程描述是否满足审计程序要求（如：测试目标清晰、抽样依据、样本量与覆盖、执行步骤、证据链、结论对应）。\n"
+            "- 仅列出“不符合/证据不足”项，每条必须包含：具体位置、原文、问题说明、修改为。\n\n"
+            "## 三、测试问题的专业判断\n"
+            "- 从IT控制测试专业角度指出方法性问题（如：设计有效与执行有效逻辑冲突、样本代表性不足、证据不可追溯、结论与记录不一致）。\n"
+            "- 每条必须包含：具体位置、原文、专业问题、修改为（含责任角色+动作）。\n\n"
+            "输出约束：\n"
+            "- 不要复述表格内容。\n"
+            "- 不输出空泛总结。\n"
+            "- 不要写影响。\n"
+            "- 对无法从截图确认的内容，标记为“需补充证据”。\n"
+            "- 如未发现问题，仅输出“未发现需要整改的问题”。"
         )
 
         try:
@@ -159,7 +189,7 @@ class ExcelImageReviewer:
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a professional data quality and spreadsheet reviewer.",
+                        "content": "你是严谨的电子表格与数据质量审阅专家，请始终用中文 Markdown 作答。",
                     },
                     {
                         "role": "user",
@@ -171,46 +201,198 @@ class ExcelImageReviewer:
                 ],
                 max_tokens=2000,
                 temperature=0.3,
+                timeout=120,
             )
             return response.choices[0].message.content
         except Exception as e:
             print(f"Error reviewing image: {e}")
             return f"Error reviewing image: {e}"
 
+    def _add_inline_runs(self, paragraph, node):
+        """Append HTML inline nodes into a docx paragraph while preserving simple styles."""
+        if isinstance(node, NavigableString):
+            text = str(node)
+            if text:
+                paragraph.add_run(text)
+            return
+        if not isinstance(node, Tag):
+            return
+
+        if node.name == "br":
+            paragraph.add_run("\n")
+            return
+
+        if node.name in ("strong", "b"):
+            run = paragraph.add_run(node.get_text())
+            run.bold = True
+            return
+        if node.name in ("em", "i"):
+            run = paragraph.add_run(node.get_text())
+            run.italic = True
+            return
+        if node.name == "code":
+            run = paragraph.add_run(node.get_text())
+            run.font.name = "Courier New"
+            return
+        if node.name == "a":
+            text = node.get_text()
+            href = node.get("href", "")
+            paragraph.add_run(f"{text} ({href})" if href else text)
+            return
+
+        for child in node.children:
+            self._add_inline_runs(paragraph, child)
+
+    def _append_markdown_to_doc(self, doc, markdown_text):
+        """Render markdown text into a Word document."""
+        html = markdown.markdown(
+            markdown_text or "",
+            extensions=["fenced_code", "tables", "sane_lists"],
+        )
+        soup = BeautifulSoup(html, "html.parser")
+
+        def render_block(tag):
+            if tag.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+                level = min(6, int(tag.name[1]))
+                p = doc.add_heading(level=level)
+                for child in tag.children:
+                    self._add_inline_runs(p, child)
+                return
+
+            if tag.name == "p":
+                p = doc.add_paragraph()
+                for child in tag.children:
+                    self._add_inline_runs(p, child)
+                return
+
+            if tag.name in ("ul", "ol"):
+                style = "List Bullet" if tag.name == "ul" else "List Number"
+                for li in tag.find_all("li", recursive=False):
+                    p = doc.add_paragraph(style=style)
+                    for child in li.children:
+                        self._add_inline_runs(p, child)
+                return
+
+            if tag.name == "pre":
+                p = doc.add_paragraph()
+                run = p.add_run(tag.get_text())
+                run.font.name = "Courier New"
+                return
+
+            if tag.name == "blockquote":
+                p = doc.add_paragraph()
+                p.style = "Intense Quote"
+                p.add_run(tag.get_text())
+                return
+
+            if tag.name == "table":
+                rows = tag.find_all("tr")
+                if not rows:
+                    return
+                col_count = max(len(r.find_all(["th", "td"])) for r in rows)
+                table = doc.add_table(rows=0, cols=col_count)
+                table.style = "Table Grid"
+                for r in rows:
+                    cells = r.find_all(["th", "td"])
+                    row_cells = table.add_row().cells
+                    for idx, cell in enumerate(cells):
+                        row_cells[idx].text = re.sub(r"\s+", " ", cell.get_text(" ", strip=True))
+                return
+
+            # Fallback: write text for unknown block tags
+            text = tag.get_text(" ", strip=True)
+            if text:
+                doc.add_paragraph(text)
+
+        for elem in soup.contents:
+            if isinstance(elem, NavigableString):
+                raw = str(elem).strip()
+                if raw:
+                    doc.add_paragraph(raw)
+                continue
+            if isinstance(elem, Tag):
+                render_block(elem)
+
+    def _sanitize_review_markdown(self, markdown_text):
+        """Remove forbidden summary fields from model output before report rendering."""
+        if not markdown_text:
+            return markdown_text
+
+        kept_lines = []
+        for line in markdown_text.splitlines():
+            stripped = line.strip()
+            if re.match(r"^(?:[-*+]\s*)?(?:\d+\.\s*)?影响(?:[:：]|\b)", stripped):
+                continue
+            kept_lines.append(line)
+        return "\n".join(kept_lines)
+
     def _excel_to_images_libreoffice(self, sheet_names):
         """Convert all sheets via LibreOffice headless → PDF → PIL Images.
         Returns {sheet_name: PIL.Image} mapped by sheet order."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            result = subprocess.run(
-                ["soffice", "--headless", "--convert-to", "pdf",
-                 "--outdir", tmpdir, str(self.excel_path)],
-                capture_output=True, timeout=120,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.decode().strip() or "LibreOffice conversion failed")
-            pdf_path = Path(tmpdir) / (Path(self.excel_path).stem + ".pdf")
-            if not pdf_path.exists():
-                raise RuntimeError(f"Expected PDF not found: {pdf_path}")
+            convert_modes = [
+                # Keep each sheet on a single PDF page to prevent partial captures
+                'pdf:calc_pdf_Export:{"SinglePageSheets":{"type":"boolean","value":"true"}}',
+                "pdf",
+            ]
             from pdf2image import convert_from_path
-            pages = convert_from_path(pdf_path, dpi=150)
-            return {name: page for name, page in zip(sheet_names, pages)}
+            last_error = "LibreOffice conversion failed"
 
-    def process_excel(self):
+            for convert_to in convert_modes:
+                result = subprocess.run(
+                    ["soffice", "--headless", "--convert-to", convert_to,
+                     "--outdir", tmpdir, str(self.excel_path)],
+                    capture_output=True, timeout=120,
+                )
+                if result.returncode != 0:
+                    stderr = result.stderr.decode().strip()
+                    last_error = stderr or f"LibreOffice conversion failed ({convert_to})"
+                    continue
+
+                pdf_path = Path(tmpdir) / (Path(self.excel_path).stem + ".pdf")
+                if not pdf_path.exists():
+                    last_error = f"Expected PDF not found: {pdf_path}"
+                    continue
+
+                pages = convert_from_path(pdf_path, dpi=150)
+                if len(pages) != len(sheet_names):
+                    last_error = (
+                        f"PDF page count ({len(pages)}) does not match sheet count "
+                        f"({len(sheet_names)}) for mode {convert_to}"
+                    )
+                    continue
+
+                return {name: page for name, page in zip(sheet_names, pages)}
+
+            raise RuntimeError(
+                f"{last_error}. To avoid incomplete screenshots, falling back to the built-in renderer."
+            )
+
+    def process_excel(self, sheets=None, limit=None):
         """Convert all sheets to images and review each one."""
         print(f"Processing: {self.excel_path}")
         try:
-            sheet_names = pd.ExcelFile(self.excel_path).sheet_names
+            all_sheet_names = pd.ExcelFile(self.excel_path).sheet_names
         except Exception as e:
             print(f"Error reading Excel file: {e}")
             return
-        print(f"Found {len(sheet_names)} sheet(s): {', '.join(sheet_names)}")
+        print(f"Found {len(all_sheet_names)} sheet(s): {', '.join(all_sheet_names)}")
+        if sheets:
+            sheet_names = [s for s in all_sheet_names if s in sheets]
+        else:
+            sheet_names = all_sheet_names
+        if limit:
+            sheet_names = sheet_names[:limit]
+        if len(sheet_names) < len(all_sheet_names):
+            print(f"Processing {len(sheet_names)} sheet(s): {', '.join(sheet_names)}")
 
         # Try LibreOffice for high-fidelity rendering; fall back to built-in PIL renderer
         libreoffice_images = {}
         if shutil.which("soffice"):
             try:
                 print("Converting with LibreOffice...")
-                libreoffice_images = self._excel_to_images_libreoffice(sheet_names)
+                # LibreOffice export is workbook-wide; map pages with full sheet order first.
+                libreoffice_images = self._excel_to_images_libreoffice(all_sheet_names)
                 print("LibreOffice conversion successful.")
             except Exception as e:
                 print(f"LibreOffice failed ({e}), falling back to built-in renderer")
@@ -234,144 +416,34 @@ class ExcelImageReviewer:
                 self.sheet_reviews[sheet_name] = f"Error: {e}"
 
     def generate_report(self):
-        """Generate an HTML report with sheet images and review results."""
+        """Generate a DOCX report with sheet images and review results."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        html_content = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Excel Review Report</title>
-    <style>
-        body {{
-            font-family: Arial, sans-serif;
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }}
-        .header {{
-            background-color: #2c3e50;
-            color: white;
-            padding: 20px;
-            border-radius: 5px;
-            margin-bottom: 20px;
-        }}
-        .header h1 {{
-            margin: 0;
-        }}
-        .metadata {{
-            color: #ecf0f1;
-            font-size: 14px;
-            margin-top: 10px;
-        }}
-        .sheet-section {{
-            background-color: white;
-            padding: 20px;
-            margin-bottom: 20px;
-            border-radius: 5px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }}
-        .sheet-title {{
-            color: #2c3e50;
-            border-bottom: 2px solid #3498db;
-            padding-bottom: 10px;
-            margin-bottom: 15px;
-        }}
-        .image-container {{
-            text-align: center;
-            margin: 20px 0;
-            background-color: #f8f9fa;
-            padding: 15px;
-            border-radius: 5px;
-        }}
-        .image-container img {{
-            max-width: 100%;
-            border: 1px solid #ddd;
-            border-radius: 3px;
-        }}
-        .review-content {{
-            line-height: 1.6;
-            color: #333;
-            white-space: pre-wrap;
-            background-color: #f8f9fa;
-            padding: 15px;
-            border-radius: 5px;
-            border-left: 4px solid #3498db;
-        }}
-        .summary {{
-            background-color: #e8f4f8;
-            padding: 15px;
-            border-radius: 5px;
-            margin-bottom: 20px;
-            border-left: 4px solid #3498db;
-        }}
-        .footer {{
-            text-align: center;
-            color: #7f8c8d;
-            font-size: 12px;
-            margin-top: 30px;
-            padding-top: 20px;
-            border-top: 1px solid #ddd;
-        }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>📊 Excel Review Report</h1>
-        <div class="metadata">
-            <p><strong>File:</strong> {os.path.basename(self.excel_path)}</p>
-            <p><strong>Generated:</strong> {timestamp}</p>
-            <p><strong>Sheets Reviewed:</strong> {len(self.sheet_reviews)}</p>
-        </div>
-    </div>
-    
-    <div class="summary">
-        <h2>📋 Summary</h2>
-        <p>This report contains automated reviews of {len(self.sheet_reviews)} sheet(s) from the Excel file. 
-        Each sheet has been converted to an image and analyzed by an AI model for potential issues including 
-        spelling errors, logical inconsistencies, data quality problems, and structural issues.</p>
-    </div>
-"""
-        
-        # Add each sheet's review
+        doc = Document()
+        doc.add_heading("Excel 审阅报告", level=1)
+        doc.add_paragraph(f"文件：{os.path.basename(self.excel_path)}")
+        doc.add_paragraph(f"生成时间：{timestamp}")
+        doc.add_paragraph(f"审阅工作表数量：{len(self.sheet_reviews)}")
+        doc.add_paragraph(
+            "说明：本报告由程序自动生成。每个工作表先转为截图，再由模型输出中文 Markdown 审阅意见，并解析写入本报告。"
+        )
+
         for sheet_name in self.sheet_reviews.keys():
             image_path = self.sheet_images.get(sheet_name)
-            review = self.sheet_reviews.get(sheet_name, "No review available")
-            
-            # Convert image path to relative path for HTML
-            if image_path:
-                rel_image_path = os.path.basename(image_path)
+            review = self.sheet_reviews.get(sheet_name, "未生成审阅意见。")
+            review = self._sanitize_review_markdown(review)
+
+            doc.add_heading(f"工作表：{sheet_name}", level=2)
+            if image_path and Path(image_path).exists():
+                doc.add_paragraph("截图预览：")
+                doc.add_picture(str(image_path), width=Inches(7.2))
             else:
-                rel_image_path = ""
-            
-            html_content += f"""
-    <div class="sheet-section">
-        <h2 class="sheet-title">📄 Sheet: {sheet_name}</h2>
-        
-        <div class="image-container">
-            <h3>Sheet Preview</h3>
-            <img src="{rel_image_path}" alt="{sheet_name} preview">
-        </div>
-        
-        <h3>🔍 Review Results</h3>
-        <div class="review-content">{review}</div>
-    </div>
-"""
-        
-        html_content += """
-    <div class="footer">
-        <p>Generated by Excel Image Reviewer</p>
-        <p>Powered by AI-based analysis</p>
-    </div>
-</body>
-</html>
-"""
-        
-        report_path = self.output_dir / "review_report.html"
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write(html_content)
+                doc.add_paragraph("截图预览：未找到截图文件。")
+
+            doc.add_heading("审阅结果", level=3)
+            self._append_markdown_to_doc(doc, review)
+
+        report_path = self.output_dir / "review_report.docx"
+        doc.save(str(report_path))
         print(f"Report saved: {report_path}")
         return report_path
 
@@ -384,6 +456,8 @@ def main():
     parser.add_argument("-o", "--output", default="output", help="Output directory (default: output)")
     parser.add_argument("-m", "--model", default=None, help="Model to use (default: OPENAI_MODEL env or gpt-4o)")
     parser.add_argument("-u", "--url", default=None, help="Base URL for OpenAI-compatible API endpoint (default: OPENAI_BASE_URL env)")
+    parser.add_argument("-s", "--sheets", nargs="+", default=None, help="Specific sheet names to process")
+    parser.add_argument("-n", "--limit", type=int, default=None, help="Limit to first N sheets")
     args = parser.parse_args()
 
     if not os.path.exists(args.excel_file):
@@ -394,7 +468,7 @@ def main():
         sys.exit(1)
 
     reviewer = ExcelImageReviewer(args.excel_file, args.output, args.model, args.url)
-    reviewer.process_excel()
+    reviewer.process_excel(sheets=args.sheets, limit=args.limit)
     report_path = reviewer.generate_report()
     print(f"\nDone! Report: {report_path}")
 
