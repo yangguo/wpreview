@@ -3,9 +3,7 @@
 Create a sample Excel file for testing the Excel Image Reviewer.
 """
 
-import pandas as pd
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
 
 def create_sample_excel(filename="sample_data.xlsx"):
     """Create a sample Excel file with multiple sheets."""

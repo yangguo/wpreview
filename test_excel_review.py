@@ -1,50 +1,37 @@
 #!/usr/bin/env python3
-"""
-Test the Excel Image Reviewer with mock LLM responses.
-This allows testing without making actual API calls.
-"""
+"""End-to-end test for structured Excel workpaper review (mock LLM)."""
 
 import os
+import subprocess
 import sys
+import tempfile
+import unittest
 from pathlib import Path
+from unittest.mock import MagicMock
 
-# Mock the LLM client before importing the main module
+from docx import Document
+
+
 class MockCompletion:
     class Choice:
         class Message:
             def __init__(self):
-                self.content = """## Review Results for Sheet
+                self.content = (
+                    "## 审阅总览\n"
+                    "- coverage_status: 部分覆盖\n"
+                    "- missing_points: 未覆盖异常闭环\n"
+                    "- risk_impact: 中\n\n"
+                    "## 问题清单\n"
+                    "|问题ID|问题类型|严重级别|定位（底稿字段/样本编号）|原文摘录|判定依据|整改建议|\n"
+                    "|---|---|---|---|---|---|---|\n"
+                    "|Q1|方法性问题|中|test_steps / R1-2|仅完成询问|缺少证据检查|补充日志与凭证检查|\n\n"
+                    "## 需补充证据\n"
+                    "- 缺少样本抽取依据文档。"
+                )
 
-### 1. Spelling and Grammar
-- **Issue Found**: "Enginering" should be "Engineering" in the Department column
-- **Issue Found**: "Jonson" appears to be misspelled, should likely be "Johnson"
-
-### 2. Logical Consistency
-- All dates appear to be in logical order
-- Salary values are within reasonable ranges
-- Employee IDs are sequential
-
-### 3. Data Quality Issues
-- **Missing Data**: Employee ID 5 (Charlie Davis) has no salary value
-- All other required fields are populated
-
-### 4. Structural Issues
-- Column headers are consistent and clear
-- No unnecessary empty rows or columns
-- Data types appear consistent within columns
-
-### 5. Suggestions
-1. Correct the spelling of "Enginering" to "Engineering"
-2. Verify and correct "Jonson" to the proper spelling (likely "Johnson")
-3. Fill in the missing salary for Charlie Davis (Employee ID 5)
-4. Consider adding a validation rule to ensure all salary fields are populated
-5. Consider standardizing date format if this will be shared across systems
-
-Overall, the sheet structure is good with just a few data quality issues to address."""
-        
         def __init__(self):
             self.message = self.Message()
-    
+
     def __init__(self):
         self.choices = [self.Choice()]
 
@@ -56,98 +43,42 @@ class MockChatCompletions:
 
 class MockClient:
     def __init__(self, **kwargs):
-        self.chat = type('obj', (object,), {'completions': MockChatCompletions()})()
+        self.chat = type("obj", (object,), {"completions": MockChatCompletions()})()
 
 
-# Monkey patch the OpenAI client used by excel_image_review.py
-from unittest.mock import MagicMock
+sys.modules["openai"] = MagicMock()
+sys.modules["openai"].OpenAI = MockClient
+sys.modules["openai"].AzureOpenAI = MockClient
 
-sys.modules['openai'] = MagicMock()
-sys.modules['openai'].OpenAI = MockClient
-sys.modules['openai'].AzureOpenAI = MockClient
-
-
-# Now import and use the real module
 from excel_image_review import ExcelImageReviewer
 
 
-def test_excel_review():
-    """Test the full Excel review workflow with mock LLM."""
-    
-    print("="*60)
-    print("Testing Excel Image Reviewer (Mock Mode)")
-    print("="*60)
-    
-    # Check if sample file exists
-    excel_file = "sample_data.xlsx"
-    if not os.path.exists(excel_file):
-        print(f"Error: {excel_file} not found. Creating it...")
-        import subprocess
-        subprocess.run([sys.executable, "create_sample_excel.py"])
-    
-    # Create test output directory
-    output_dir = "/tmp/excel_review_test"
-    Path(output_dir).mkdir(exist_ok=True)
-    
-    print(f"\nInput file: {excel_file}")
-    print(f"Output directory: {output_dir}")
-    
-    # Create reviewer
-    reviewer = ExcelImageReviewer(excel_file, output_dir, model_name="gpt-4-turbo")
-    
-    # Process all sheets
-    print("\n" + "-"*60)
-    reviewer.process_excel()
-    
-    # Generate report
-    print("\n" + "-"*60)
-    report_path = reviewer.generate_report()
-    
-    # Verify outputs
-    print("\n" + "="*60)
-    print("Verification:")
-    print("="*60)
-    
-    # Check images
-    assert reviewer.sheet_images, "No sheet images were generated"
-    for sheet_name, image_path in reviewer.sheet_images.items():
-        if os.path.exists(image_path):
-            size = os.path.getsize(image_path)
-            print(f"✓ Image for '{sheet_name}': {image_path} ({size} bytes)")
-            assert size > 0, f"Generated image for '{sheet_name}' is empty"
-        else:
-            print(f"✗ Image for '{sheet_name}' not found!")
-            assert False, f"Image for '{sheet_name}' was not created"
-    
-    # Check report
-    if os.path.exists(report_path):
-        size = os.path.getsize(report_path)
-        print(f"✓ Report: {report_path} ({size} bytes)")
-        assert size > 0, "Generated report file is empty"
-        
-        # Show a preview of the report
-        print("\nReport Preview (first 500 chars):")
-        with open(report_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-            print(content[:500])
-            print("...")
-    else:
-        print(f"✗ Report not found!")
-        assert False, "Report file was not created"
-    
-    # Check reviews
-    print(f"\n✓ Total reviews generated: {len(reviewer.sheet_reviews)}")
-    assert reviewer.sheet_reviews, "No reviews were generated"
-    for sheet_name, review_text in reviewer.sheet_reviews.items():
-        assert "Enginering" in review_text, f"Mock review text missing for '{sheet_name}'"
-    
-    print("\n" + "="*60)
-    print("✅ Test completed successfully!")
-    print("="*60)
-    print(f"\nYou can view the report at: {report_path}")
-    
-    return reviewer, report_path
+class EndToEndStructuredReviewTests(unittest.TestCase):
+    def test_full_workflow_generates_structured_payload_and_docx_report(self):
+        if not os.path.exists("sample_data.xlsx"):
+            subprocess.run([sys.executable, "create_sample_excel.py"], check=True)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            reviewer = ExcelImageReviewer("sample_data.xlsx", tmp_dir, model_name="gpt-4o")
+            reviewer.process_excel(limit=1)
+            report_path = reviewer.generate_report()
+
+            self.assertTrue(reviewer.sheet_structures)
+            self.assertTrue(reviewer.sheet_schema_records is not None)
+            self.assertTrue(reviewer.sheet_reviews)
+
+            payload_files = list(Path(tmp_dir).glob("*_structured.json"))
+            self.assertTrue(payload_files, "Expected structured JSON payload output")
+
+            self.assertTrue(Path(report_path).exists())
+            self.assertEqual(Path(report_path).suffix, ".docx")
+
+            doc = Document(str(report_path))
+            text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            self.assertIn("Excel 底稿结构化审阅报告", text)
+            self.assertIn("审阅结果", text)
+            self.assertIn("审阅总览", text)
 
 
 if __name__ == "__main__":
-    reviewer, report_path = test_excel_review()
+    unittest.main()

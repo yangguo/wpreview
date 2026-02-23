@@ -1,9 +1,6 @@
 python-dotenv
 openai
 openpyxl
-pillow
-pandas
-pdf2image
 python-docx
 markdown
 beautifulsoup4

@@ -1,186 +1,339 @@
 #!/usr/bin/env python3
-"""Excel Image Reviewer - Convert Excel sheets to images and review with LLM vision."""
+"""Excel Structured Reviewer - Read Excel directly and review with LLM."""
 
 import argparse
-import base64
-import io
+import json
 import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-import pandas as pd
-from dotenv import load_dotenv
-from openai import OpenAI
-from PIL import Image, ImageDraw, ImageFont
+import markdown
+import openpyxl
 from bs4 import BeautifulSoup, NavigableString, Tag
 from docx import Document
-from docx.shared import Inches
-import openpyxl
-from openpyxl.utils import get_column_letter
-import markdown
+from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
+STANDARD_SCHEMA_FIELDS = [
+    "control_id",
+    "control_description",
+    "audit_objective",
+    "audit_procedure",
+    "sample_selection_method",
+    "sample_size",
+    "test_steps",
+    "test_result",
+    "exception_flag",
+    "conclusion",
+]
+
+FIELD_ALIASES = {
+    "control_id": ["control id", "控制编号", "控制id", "编号", "id"],
+    "control_description": ["control description", "控制描述", "控制要求", "控制活动描述"],
+    "audit_objective": ["audit objective", "审计目标", "测试目标"],
+    "audit_procedure": ["audit procedure", "审计程序", "测试程序", "审计步骤", "程序要求"],
+    "sample_selection_method": ["sample selection method", "抽样方法", "选样方法", "样本抽样依据", "抽样依据"],
+    "sample_size": ["sample size", "样本量", "抽样数量", "样本数量"],
+    "test_steps": ["test steps", "测试步骤", "执行步骤", "测试过程", "检查步骤"],
+    "test_result": ["test result", "测试结果", "执行结果", "检查结果", "结果"],
+    "exception_flag": ["exception flag", "是否例外", "例外标记", "异常标记", "缺陷标记"],
+    "conclusion": ["conclusion", "结论", "审计结论", "控制结论"],
+}
+
 
 class ExcelImageReviewer:
-    """Convert Excel sheets to images and review them using LLM vision."""
+    """Read Excel structure directly and review workpapers with LLM."""
 
     def __init__(self, excel_path, output_dir="output", model_name=None, base_url=None):
         self.excel_path = excel_path
         self.output_dir = Path(output_dir)
         self.model_name = model_name or os.getenv("OPENAI_MODEL", "gpt-4o")
-        self.output_dir.mkdir(exist_ok=True)
-        self.sheet_images = {}
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.sheet_structures = {}
+        self.sheet_schema_records = {}
         self.sheet_reviews = {}
+
+        self._workbook = None
+
         client_kwargs = {"api_key": os.getenv("OPENAI_API_KEY")}
         resolved_url = base_url or os.getenv("OPENAI_BASE_URL")
         if resolved_url:
             client_kwargs["base_url"] = resolved_url
         self.client = OpenAI(**client_kwargs)
 
-    def excel_to_image(self, sheet_name):
-        """Convert an Excel sheet to a PIL Image covering only the populated content area."""
-        wb = openpyxl.load_workbook(self.excel_path, data_only=True)
+    @staticmethod
+    def _is_empty(value):
+        return value is None or (isinstance(value, str) and value.strip() == "")
+
+    @staticmethod
+    def _normalize_text(text):
+        if text is None:
+            return ""
+        normalized = str(text).strip().lower()
+        return re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", normalized)
+
+    def _map_schema_field(self, label):
+        normalized = self._normalize_text(label)
+        if not normalized:
+            return None
+
+        for field in STANDARD_SCHEMA_FIELDS:
+            if normalized == self._normalize_text(field):
+                return field
+
+        for field, aliases in FIELD_ALIASES.items():
+            alias_tokens = [self._normalize_text(alias) for alias in aliases]
+            if normalized in alias_tokens:
+                return field
+            if any(alias and (alias in normalized or normalized in alias) for alias in alias_tokens):
+                return field
+        return None
+
+    def _load_workbook(self):
+        if self._workbook is None:
+            self._workbook = openpyxl.load_workbook(self.excel_path, data_only=False)
+        return self._workbook
+
+    def _detect_table_regions(self, non_empty_positions):
+        """Detect contiguous non-empty cell blocks as table regions."""
+        unvisited = set(non_empty_positions)
+        regions = []
+
+        while unvisited:
+            start = min(unvisited)
+            queue = deque([start])
+            component = set([start])
+            unvisited.remove(start)
+
+            while queue:
+                row, col = queue.popleft()
+                neighbors = [
+                    (row - 1, col),
+                    (row + 1, col),
+                    (row, col - 1),
+                    (row, col + 1),
+                ]
+                for neighbor in neighbors:
+                    if neighbor in unvisited:
+                        unvisited.remove(neighbor)
+                        component.add(neighbor)
+                        queue.append(neighbor)
+
+            rows = [r for r, _ in component]
+            cols = [c for _, c in component]
+            min_row, max_row = min(rows), max(rows)
+            min_col, max_col = min(cols), max(cols)
+            regions.append(
+                {
+                    "region_id": f"R{len(regions) + 1}",
+                    "min_row": min_row,
+                    "max_row": max_row,
+                    "min_col": min_col,
+                    "max_col": max_col,
+                    "cell_count": len(component),
+                    "span": f"{openpyxl.utils.get_column_letter(min_col)}{min_row}:{openpyxl.utils.get_column_letter(max_col)}{max_row}",
+                }
+            )
+
+        regions.sort(key=lambda item: (item["min_row"], item["min_col"]))
+        for idx, region in enumerate(regions, start=1):
+            region["region_id"] = f"R{idx}"
+        return regions
+
+    def extract_sheet_structure(self, sheet_name):
+        """Read sheet cells with coordinates, row/col positions, and merged ranges."""
+        wb = self._load_workbook()
         ws = wb[sheet_name]
 
-        if ws.max_row is None or ws.max_column is None:
-            print(f"Warning: Sheet '{sheet_name}' is empty")
-            return None
+        max_row = ws.max_row or 0
+        max_col = ws.max_column or 0
+        cells = []
+        non_empty_positions = set()
 
-        min_r, max_r = ws.min_row, ws.max_row
-        min_c, max_c = ws.min_column, ws.max_column
+        for row in range(1, max_row + 1):
+            for col in range(1, max_col + 1):
+                cell = ws.cell(row=row, column=col)
+                if self._is_empty(cell.value):
+                    continue
 
-        # Trim trailing blank rows
-        while max_r >= min_r:
-            if any(ws.cell(max_r, c).value not in (None, "") for c in range(min_c, max_c + 1)):
-                break
-            max_r -= 1
+                value = str(cell.value)
+                cell_record = {
+                    "coord": cell.coordinate,
+                    "row": row,
+                    "column": col,
+                    "value": value,
+                    "data_type": cell.data_type,
+                    "is_formula": value.startswith("="),
+                }
+                cells.append(cell_record)
+                non_empty_positions.add((row, col))
 
-        # Trim trailing blank columns
-        while max_c >= min_c:
-            if any(ws.cell(r, max_c).value not in (None, "") for r in range(min_r, max_r + 1)):
-                break
-            max_c -= 1
+        merged_ranges = []
+        for merged in ws.merged_cells.ranges:
+            merged_ranges.append(
+                {
+                    "range": str(merged),
+                    "min_row": merged.min_row,
+                    "max_row": merged.max_row,
+                    "min_col": merged.min_col,
+                    "max_col": merged.max_col,
+                }
+            )
 
-        if max_r < min_r or max_c < min_c:
-            print(f"Warning: Sheet '{sheet_name}' is empty")
-            return None
+        table_regions = self._detect_table_regions(non_empty_positions)
 
-        rows = [
-            [str(ws.cell(r, c).value) if ws.cell(r, c).value is not None else ""
-             for c in range(min_c, max_c + 1)]
-            for r in range(min_r, max_r + 1)
-        ]
+        structure = {
+            "sheet_name": sheet_name,
+            "max_row": max_row,
+            "max_column": max_col,
+            "non_empty_cell_count": len(cells),
+            "cells": sorted(cells, key=lambda item: (item["row"], item["column"])),
+            "merged_ranges": merged_ranges,
+            "table_regions": table_regions,
+        }
+        self.sheet_structures[sheet_name] = structure
+        return structure
 
-        col_widths = []
-        for c in range(min_c, max_c + 1):
-            dim = ws.column_dimensions.get(get_column_letter(c))
-            w = dim.width if (dim and dim.width) else 10
-            col_widths.append(max(80, int(w * 7)))
+    def _extract_from_tabular_region(self, region, cell_map):
+        min_row, max_row = region["min_row"], region["max_row"]
+        min_col, max_col = region["min_col"], region["max_col"]
 
-        row_heights = []
-        for r in range(min_r, max_r + 1):
-            dim = ws.row_dimensions.get(r)
-            h = dim.height if (dim and dim.height) else 15
-            row_heights.append(max(22, int(h * 1.33)))
+        header_row = min_row
+        mapped_columns = {}
 
-        return self._render_table_image(rows, col_widths, row_heights, sheet_name)
+        for col in range(min_col, max_col + 1):
+            label = cell_map.get((header_row, col))
+            field = self._map_schema_field(label)
+            if field:
+                mapped_columns[col] = field
 
-    def _render_table_image(self, rows, col_widths, row_heights, title):
-        """Render a 2D list of cell strings as a PIL Image table."""
-        PADDING, TITLE_H = 10, 35
-        total_w = PADDING * 2 + sum(col_widths)
-        total_h = PADDING + TITLE_H + sum(row_heights) + PADDING
+        if len(mapped_columns) < 2:
+            return []
 
-        img = Image.new("RGB", (total_w, total_h), "white")
-        draw = ImageDraw.Draw(img)
+        records = []
+        for row in range(header_row + 1, max_row + 1):
+            record = {field: None for field in STANDARD_SCHEMA_FIELDS}
+            source_cells = {}
+            has_value = False
 
-        def load_font(candidates, size):
-            for path in candidates:
-                if os.path.exists(path):
-                    try:
-                        return ImageFont.truetype(path, size)
-                    except Exception:
-                        pass
-            return ImageFont.load_default()
+            for col, field in mapped_columns.items():
+                value = cell_map.get((row, col))
+                if not self._is_empty(value):
+                    record[field] = value
+                    source_cells[field] = f"{openpyxl.utils.get_column_letter(col)}{row}"
+                    has_value = True
 
-        bold_candidates = [
-            "/System/Library/Fonts/PingFang.ttc",
-            "/System/Library/Fonts/Hiragino Sans GB.ttc",
-            "/System/Library/Fonts/STHeiti Medium.ttc",
-            "/System/Library/Fonts/Supplemental/Songti.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-            "/Library/Fonts/Arial Bold.ttf",
-        ]
-        reg_candidates = [
-            "/System/Library/Fonts/PingFang.ttc",
-            "/System/Library/Fonts/Hiragino Sans GB.ttc",
-            "/System/Library/Fonts/STHeiti Light.ttc",
-            "/System/Library/Fonts/Supplemental/Songti.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/System/Library/Fonts/Supplemental/Arial.ttf",
-            "/Library/Fonts/Arial.ttf",
-        ]
-        title_font = load_font(bold_candidates, 13)
-        bold_font = load_font(bold_candidates, 11)
-        cell_font = load_font(reg_candidates, 10)
+            if has_value:
+                record["sample_id"] = f"{region['region_id']}-{row}"
+                record["source_cells"] = source_cells
+                records.append(record)
 
-        draw.text((PADDING, PADDING), title, fill="#2c3e50", font=title_font)
-        y = PADDING + TITLE_H
+        return records
 
-        for row_idx, (row, rh) in enumerate(zip(rows, row_heights)):
-            x = PADDING
-            is_header = row_idx == 0
-            for cell_val, cw in zip(row, col_widths):
-                fill = "#cfe2f3" if is_header else ("white" if row_idx % 2 == 0 else "#f5f5f5")
-                draw.rectangle([(x, y), (x + cw - 1, y + rh - 1)], fill=fill, outline="#bbbbbb")
-                font = bold_font if is_header else cell_font
-                max_chars = max(4, (cw - 8) // 6)
-                text = cell_val[:max_chars] + ("\u2026" if len(cell_val) > max_chars else "")
-                draw.text((x + 4, y + max(2, (rh - 12) // 2)), text, fill="#1a1a1a", font=font)
-                x += cw
-            y += rh
+    def _extract_from_key_value_region(self, region, cell_map):
+        min_row, max_row = region["min_row"], region["max_row"]
+        min_col, max_col = region["min_col"], region["max_col"]
 
-        return img
+        record = {field: None for field in STANDARD_SCHEMA_FIELDS}
+        source_cells = {}
+        mapped_count = 0
 
-    def review_image(self, image, sheet_name):
-        """Review a sheet image using LLM vision and return the review text."""
-        buffered = io.BytesIO()
-        image.save(buffered, format="PNG")
-        img_base64 = base64.b64encode(buffered.getvalue()).decode()
+        for row in range(min_row, max_row + 1):
+            for col in range(min_col, max_col):
+                label = cell_map.get((row, col))
+                field = self._map_schema_field(label)
+                if not field:
+                    continue
+
+                value_col = col + 1
+                while value_col <= max_col and self._is_empty(cell_map.get((row, value_col))):
+                    value_col += 1
+                if value_col <= max_col:
+                    value = cell_map.get((row, value_col))
+                    if not self._is_empty(value):
+                        record[field] = value
+                        source_cells[field] = f"{openpyxl.utils.get_column_letter(value_col)}{row}"
+                        mapped_count += 1
+
+        if mapped_count < 2:
+            return []
+
+        record["sample_id"] = f"{region['region_id']}-KV"
+        record["source_cells"] = source_cells
+        return [record]
+
+    def map_sheet_to_schema(self, sheet_name):
+        """Map extracted table content to the standard audit workpaper schema."""
+        if sheet_name not in self.sheet_structures:
+            self.extract_sheet_structure(sheet_name)
+
+        structure = self.sheet_structures[sheet_name]
+        cell_map = {
+            (cell["row"], cell["column"]): cell["value"]
+            for cell in structure["cells"]
+        }
+
+        schema_records = []
+        for region in structure["table_regions"]:
+            tabular_records = self._extract_from_tabular_region(region, cell_map)
+            if tabular_records:
+                schema_records.extend(tabular_records)
+                continue
+
+            kv_records = self._extract_from_key_value_region(region, cell_map)
+            if kv_records:
+                schema_records.extend(kv_records)
+
+        self.sheet_schema_records[sheet_name] = schema_records
+        return schema_records
+
+    def _build_sheet_review_payload(self, sheet_name):
+        structure = self.sheet_structures.get(sheet_name, {})
+        schema_records = self.sheet_schema_records.get(sheet_name, [])
+
+        return {
+            "sheet_name": sheet_name,
+            "standard_schema": STANDARD_SCHEMA_FIELDS,
+            "structure_summary": {
+                "max_row": structure.get("max_row", 0),
+                "max_column": structure.get("max_column", 0),
+                "non_empty_cell_count": structure.get("non_empty_cell_count", 0),
+                "merged_ranges": structure.get("merged_ranges", []),
+                "table_regions": structure.get("table_regions", []),
+            },
+            "schema_records": schema_records,
+            "cell_excerpt": structure.get("cells", [])[:200],
+        }
+
+    def review_structured_sheet(self, sheet_name):
+        """Review a sheet using structured Excel content (no image recognition)."""
+        payload = self._build_sheet_review_payload(sheet_name)
 
         prompt = (
-            f"你是IT审计与数据质量双领域审阅专家。请审阅该电子表格截图（sheet: {sheet_name}），"
-            "仅使用中文输出标准 Markdown。\n\n"
-            "目标：直接给出问题，定位到具体语句并给出可执行修改，不要写笼统总结。\n\n"
-            "请按以下固定结构输出：\n"
-            "## 一、逐条问题定位与整改意见\n"
-            "- 仅列出有问题项，最多10条，按高/中/低排序。\n"
-            "- 每条必须包含：具体位置（如表名+单元格/行列描述）、原文、问题说明、修改为、优先级。\n"
-            "- 必须指出具体哪句话有问题，不能只做概括。\n"
-            "- 不要写影响，不要写背景。\n\n"
-            "## 二、审计程序要求符合性\n"
-            "- 判断测试过程描述是否满足审计程序要求（如：测试目标清晰、抽样依据、样本量与覆盖、执行步骤、证据链、结论对应）。\n"
-            "- 仅列出“不符合/证据不足”项，每条必须包含：具体位置、原文、问题说明、修改为。\n\n"
-            "## 三、测试问题的专业判断\n"
-            "- 从IT控制测试专业角度指出方法性问题（如：设计有效与执行有效逻辑冲突、样本代表性不足、证据不可追溯、结论与记录不一致）。\n"
-            "- 每条必须包含：具体位置、原文、专业问题、修改为（含责任角色+动作）。\n\n"
-            "输出约束：\n"
-            "- 不要复述表格内容。\n"
-            "- 不输出空泛总结。\n"
-            "- 不要写影响。\n"
-            "- 对无法从截图确认的内容，标记为“需补充证据”。\n"
-            "- 如未发现问题，仅输出“未发现需要整改的问题”。"
+            "你是IT审计底稿审阅专家。输入数据来自 openpyxl 对 Excel 的结构化读取，不是截图。\n"
+            "请按以下四个维度审阅：\n"
+            "A. 覆盖性：测试过程是否覆盖审计程序要求，输出 coverage_status（完整/部分覆盖/未覆盖）、missing_points、risk_impact。\n"
+            "B. 方法性问题：识别如仅询问无证据、只测设计不测执行、抽样依据不清、样本量不足、无例外闭环、证据与结论不匹配。\n"
+            "C. 逻辑问题（内部自洽）：测试结果、结论、步骤之间矛盾。\n"
+            "D. 跨字段一致性：控制描述/审计程序/测试过程/测试结果/结论/例外标记/期间与样本日期。\n\n"
+            "输出必须为中文 Markdown，严格使用以下结构：\n"
+            "## 审阅总览\n"
+            "- coverage_status: \n"
+            "- missing_points: \n"
+            "- risk_impact: \n\n"
+            "## 问题清单\n"
+            "|问题ID|问题类型|严重级别|定位（底稿字段/样本编号）|原文摘录|判定依据|整改建议|\n"
+            "|---|---|---|---|---|---|---|\n"
+            "至少输出1行；如果无问题，输出“未发现重大问题”，并给出“建议补充检查项”。\n\n"
+            "## 需补充证据\n"
+            "- 列出无法直接从当前底稿判断但影响结论可靠性的证据缺口。\n\n"
+            "定位必须引用字段名或 sample_id；原文摘录必须来自输入内容，不可编造。"
         )
 
         try:
@@ -189,24 +342,29 @@ class ExcelImageReviewer:
                 messages=[
                     {
                         "role": "system",
-                        "content": "你是严谨的电子表格与数据质量审阅专家，请始终用中文 Markdown 作答。",
+                        "content": "你是严谨的IT审计底稿审阅专家，请始终使用中文 Markdown。",
                     },
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}"}},
-                        ],
+                        "content": (
+                            f"审阅对象: {sheet_name}\n\n"
+                            f"审阅要求:\n{prompt}\n\n"
+                            f"结构化输入(JSON):\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+                        ),
                     },
                 ],
-                max_tokens=2000,
-                temperature=0.3,
-                timeout=120,
+                max_tokens=2200,
+                temperature=0.2,
+                timeout=180,
             )
             return response.choices[0].message.content
-        except Exception as e:
-            print(f"Error reviewing image: {e}")
-            return f"Error reviewing image: {e}"
+        except Exception as exc:
+            return f"Error reviewing structured sheet: {exc}"
+
+    # Backward-compatible alias for callers still using the old method name.
+    def review_image(self, image, sheet_name):
+        del image
+        return self.review_structured_sheet(sheet_name)
 
     def _add_inline_runs(self, paragraph, node):
         """Append HTML inline nodes into a docx paragraph while preserving simple styles."""
@@ -245,10 +403,7 @@ class ExcelImageReviewer:
 
     def _append_markdown_to_doc(self, doc, markdown_text):
         """Render markdown text into a Word document."""
-        html = markdown.markdown(
-            markdown_text or "",
-            extensions=["fenced_code", "tables", "sane_lists"],
-        )
+        html = markdown.markdown(markdown_text or "", extensions=["fenced_code", "tables", "sane_lists"])
         soup = BeautifulSoup(html, "html.parser")
 
         def render_block(tag):
@@ -292,14 +447,13 @@ class ExcelImageReviewer:
                 col_count = max(len(r.find_all(["th", "td"])) for r in rows)
                 table = doc.add_table(rows=0, cols=col_count)
                 table.style = "Table Grid"
-                for r in rows:
-                    cells = r.find_all(["th", "td"])
+                for row_tag in rows:
+                    cells = row_tag.find_all(["th", "td"])
                     row_cells = table.add_row().cells
                     for idx, cell in enumerate(cells):
                         row_cells[idx].text = re.sub(r"\s+", " ", cell.get_text(" ", strip=True))
                 return
 
-            # Fallback: write text for unknown block tags
             text = tag.get_text(" ", strip=True)
             if text:
                 doc.add_paragraph(text)
@@ -313,131 +467,98 @@ class ExcelImageReviewer:
             if isinstance(elem, Tag):
                 render_block(elem)
 
-    def _sanitize_review_markdown(self, markdown_text):
-        """Remove forbidden summary fields from model output before report rendering."""
-        if not markdown_text:
-            return markdown_text
-
-        kept_lines = []
-        for line in markdown_text.splitlines():
-            stripped = line.strip()
-            if re.match(r"^(?:[-*+]\s*)?(?:\d+\.\s*)?影响(?:[:：]|\b)", stripped):
-                continue
-            kept_lines.append(line)
-        return "\n".join(kept_lines)
-
-    def _excel_to_images_libreoffice(self, sheet_names):
-        """Convert all sheets via LibreOffice headless → PDF → PIL Images.
-        Returns {sheet_name: PIL.Image} mapped by sheet order."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            convert_modes = [
-                # Keep each sheet on a single PDF page to prevent partial captures
-                'pdf:calc_pdf_Export:{"SinglePageSheets":{"type":"boolean","value":"true"}}',
-                "pdf",
-            ]
-            from pdf2image import convert_from_path
-            last_error = "LibreOffice conversion failed"
-
-            for convert_to in convert_modes:
-                result = subprocess.run(
-                    ["soffice", "--headless", "--convert-to", convert_to,
-                     "--outdir", tmpdir, str(self.excel_path)],
-                    capture_output=True, timeout=120,
-                )
-                if result.returncode != 0:
-                    stderr = result.stderr.decode().strip()
-                    last_error = stderr or f"LibreOffice conversion failed ({convert_to})"
-                    continue
-
-                pdf_path = Path(tmpdir) / (Path(self.excel_path).stem + ".pdf")
-                if not pdf_path.exists():
-                    last_error = f"Expected PDF not found: {pdf_path}"
-                    continue
-
-                pages = convert_from_path(pdf_path, dpi=150)
-                if len(pages) != len(sheet_names):
-                    last_error = (
-                        f"PDF page count ({len(pages)}) does not match sheet count "
-                        f"({len(sheet_names)}) for mode {convert_to}"
-                    )
-                    continue
-
-                return {name: page for name, page in zip(sheet_names, pages)}
-
-            raise RuntimeError(
-                f"{last_error}. To avoid incomplete screenshots, falling back to the built-in renderer."
-            )
+    def _save_sheet_payload_json(self, sheet_name):
+        payload = self._build_sheet_review_payload(sheet_name)
+        payload_path = self.output_dir / f"{sheet_name}_structured.json"
+        with open(payload_path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+        return payload_path
 
     def process_excel(self, sheets=None, limit=None):
-        """Convert all sheets to images and review each one."""
+        """Read sheet structures, map schema fields, and review each sheet with LLM."""
         print(f"Processing: {self.excel_path}")
-        try:
-            all_sheet_names = pd.ExcelFile(self.excel_path).sheet_names
-        except Exception as e:
-            print(f"Error reading Excel file: {e}")
-            return
+
+        wb = self._load_workbook()
+        all_sheet_names = wb.sheetnames
         print(f"Found {len(all_sheet_names)} sheet(s): {', '.join(all_sheet_names)}")
+
         if sheets:
-            sheet_names = [s for s in all_sheet_names if s in sheets]
+            sheet_names = [name for name in all_sheet_names if name in sheets]
         else:
             sheet_names = all_sheet_names
+
         if limit:
             sheet_names = sheet_names[:limit]
+
         if len(sheet_names) < len(all_sheet_names):
             print(f"Processing {len(sheet_names)} sheet(s): {', '.join(sheet_names)}")
 
-        # Try LibreOffice for high-fidelity rendering; fall back to built-in PIL renderer
-        libreoffice_images = {}
-        if shutil.which("soffice"):
-            try:
-                print("Converting with LibreOffice...")
-                # LibreOffice export is workbook-wide; map pages with full sheet order first.
-                libreoffice_images = self._excel_to_images_libreoffice(all_sheet_names)
-                print("LibreOffice conversion successful.")
-            except Exception as e:
-                print(f"LibreOffice failed ({e}), falling back to built-in renderer")
-        else:
-            print("LibreOffice not found, using built-in PIL renderer")
-
         for sheet_name in sheet_names:
-            print(f"\n[{sheet_name}] Converting to image...")
+            print(f"\n[{sheet_name}] Extracting structure...")
             try:
-                image = libreoffice_images.get(sheet_name) or self.excel_to_image(sheet_name)
-                if image is None:
-                    continue
-                image_path = self.output_dir / f"{sheet_name}_screenshot.png"
-                image.save(image_path)
-                self.sheet_images[sheet_name] = image_path
+                self.extract_sheet_structure(sheet_name)
+                self.map_sheet_to_schema(sheet_name)
+                payload_path = self._save_sheet_payload_json(sheet_name)
+                print(f"[{sheet_name}] Structured payload saved: {payload_path}")
                 print(f"[{sheet_name}] Reviewing with LLM...")
-                self.sheet_reviews[sheet_name] = self.review_image(image, sheet_name)
+                self.sheet_reviews[sheet_name] = self.review_structured_sheet(sheet_name)
                 print(f"[{sheet_name}] Done.")
-            except Exception as e:
-                print(f"[{sheet_name}] Error: {e}")
-                self.sheet_reviews[sheet_name] = f"Error: {e}"
+            except Exception as exc:
+                print(f"[{sheet_name}] Error: {exc}")
+                self.sheet_reviews[sheet_name] = f"Error: {exc}"
+
+    def _append_schema_preview_table(self, doc, schema_records):
+        if not schema_records:
+            doc.add_paragraph("未抽取到可映射标准 Schema 的记录。")
+            return
+
+        preview = schema_records[:8]
+        columns = ["sample_id"] + STANDARD_SCHEMA_FIELDS
+        table = doc.add_table(rows=1, cols=len(columns))
+        table.style = "Table Grid"
+        for idx, col in enumerate(columns):
+            table.rows[0].cells[idx].text = col
+
+        for record in preview:
+            row_cells = table.add_row().cells
+            for idx, col in enumerate(columns):
+                row_cells[idx].text = str(record.get(col, "") or "")
+
+        if len(schema_records) > len(preview):
+            doc.add_paragraph(f"仅展示前 {len(preview)} 条，共 {len(schema_records)} 条。")
 
     def generate_report(self):
-        """Generate a DOCX report with sheet images and review results."""
+        """Generate a DOCX report based on structured extraction and LLM results."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         doc = Document()
-        doc.add_heading("Excel 审阅报告", level=1)
+        doc.add_heading("Excel 底稿结构化审阅报告", level=1)
         doc.add_paragraph(f"文件：{os.path.basename(self.excel_path)}")
         doc.add_paragraph(f"生成时间：{timestamp}")
         doc.add_paragraph(f"审阅工作表数量：{len(self.sheet_reviews)}")
         doc.add_paragraph(
-            "说明：本报告由程序自动生成。每个工作表先转为截图，再由模型输出中文 Markdown 审阅意见，并解析写入本报告。"
+            "说明：本报告基于 openpyxl 直接读取单元格坐标、行列位置、合并信息与 Schema 映射结果，再由 LLM 完成覆盖性/方法性/逻辑/一致性审阅。"
         )
 
         for sheet_name in self.sheet_reviews.keys():
-            image_path = self.sheet_images.get(sheet_name)
+            structure = self.sheet_structures.get(sheet_name, {})
+            schema_records = self.sheet_schema_records.get(sheet_name, [])
             review = self.sheet_reviews.get(sheet_name, "未生成审阅意见。")
-            review = self._sanitize_review_markdown(review)
 
             doc.add_heading(f"工作表：{sheet_name}", level=2)
-            if image_path and Path(image_path).exists():
-                doc.add_paragraph("截图预览：")
-                doc.add_picture(str(image_path), width=Inches(7.2))
-            else:
-                doc.add_paragraph("截图预览：未找到截图文件。")
+            doc.add_paragraph(
+                f"非空单元格：{structure.get('non_empty_cell_count', 0)}；"
+                f"表格区域：{len(structure.get('table_regions', []))}；"
+                f"合并单元格区域：{len(structure.get('merged_ranges', []))}；"
+                f"Schema记录：{len(schema_records)}"
+            )
+
+            merged_ranges = structure.get("merged_ranges", [])
+            if merged_ranges:
+                merged_preview = ", ".join(item["range"] for item in merged_ranges[:10])
+                doc.add_paragraph(f"合并区域（预览）：{merged_preview}")
+
+            doc.add_heading("标准 Schema 抽取结果（预览）", level=3)
+            self._append_schema_preview_table(doc, schema_records)
 
             doc.add_heading("审阅结果", level=3)
             self._append_markdown_to_doc(doc, review)
@@ -450,7 +571,7 @@ class ExcelImageReviewer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert Excel sheets to images and review with LLM vision"
+        description="Read Excel structure directly and review with LLM"
     )
     parser.add_argument("excel_file", help="Path to the Excel file")
     parser.add_argument("-o", "--output", default="output", help="Output directory (default: output)")
