@@ -34,16 +34,31 @@ STANDARD_SCHEMA_FIELDS = [
 
 FIELD_ALIASES = {
     "control_id": ["control id", "控制编号", "控制id", "编号", "id"],
-    "control_description": ["control description", "控制描述", "控制要求", "控制活动描述"],
+    "control_description": ["control description", "控制描述", "控制要求", "控制活动描述", "控制活动"],
     "audit_objective": ["audit objective", "审计目标", "测试目标"],
-    "audit_procedure": ["audit procedure", "审计程序", "测试程序", "审计步骤", "程序要求"],
-    "sample_selection_method": ["sample selection method", "抽样方法", "选样方法", "样本抽样依据", "抽样依据"],
-    "sample_size": ["sample size", "样本量", "抽样数量", "样本数量"],
+    "audit_procedure": ["audit procedure", "审计程序", "测试程序", "审计步骤", "程序要求", "标准审计程序", "执行的审计程序"],
+    "sample_selection_method": ["sample selection method", "抽样方法", "选样方法", "样本抽样依据", "抽样依据", "控制类型", "发生频率"],
+    "sample_size": ["sample size", "样本量", "抽样数量", "样本数量", "样本总量", "测试期间样本总量", "测试期间样本量"],
     "test_steps": ["test steps", "测试步骤", "执行步骤", "测试过程", "检查步骤"],
-    "test_result": ["test result", "测试结果", "执行结果", "检查结果", "结果"],
-    "exception_flag": ["exception flag", "是否例外", "例外标记", "异常标记", "缺陷标记"],
-    "conclusion": ["conclusion", "结论", "审计结论", "控制结论"],
+    "test_result": ["test result", "测试结果", "执行结果", "检查结果", "结果", "设计有效性测试结论", "设计有效性结论"],
+    "exception_flag": ["exception flag", "是否例外", "例外标记", "异常标记", "缺陷标记", "是否发现异常", "是否异常"],
+    "conclusion": ["conclusion", "结论", "审计结论", "控制结论", "执行有效性测试结论", "执行有效性结论"],
 }
+
+CONTEXT_CARRY_FIELDS = [
+    "control_id",
+    "control_description",
+    "audit_objective",
+    "audit_procedure",
+    "sample_selection_method",
+]
+
+# Only longer aliases use fuzzy "contains" matching to avoid false positives
+# from short tokens like "id" or "结果".
+MIN_FUZZY_ALIAS_LEN = 3
+
+# Domain-specific phrases used to infer a positive/clean result in Q&A layouts.
+QA_POSITIVE_RESULT_HINTS = ("未见异常", "无异常")
 
 
 class ExcelImageReviewer:
@@ -91,9 +106,40 @@ class ExcelImageReviewer:
             alias_tokens = [self._normalize_text(alias) for alias in aliases]
             if normalized in alias_tokens:
                 return field
-            if any(alias and (alias in normalized or normalized in alias) for alias in alias_tokens):
+            if any(alias and len(alias) >= MIN_FUZZY_ALIAS_LEN and (alias in normalized) for alias in alias_tokens):
                 return field
         return None
+
+    def _resolve_formula_reference(self, value, depth=0):
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return str(value)
+
+        text = value.strip()
+        if not text.startswith("="):
+            return value
+        if depth >= 3:
+            return value
+
+        match = re.match(r"^=\s*(?:'((?:[^']|'')+)'|([^'!]+))!([$]?[A-Za-z]+[$]?\d+)$", text)
+        if not match:
+            return value
+
+        sheet_name = (match.group(1) or match.group(2) or "").replace("''", "'")
+        coord = match.group(3).replace("$", "")
+        try:
+            wb = self._load_workbook()
+            target_ws = wb[sheet_name]
+            target_value = target_ws[coord].value
+        except (KeyError, ValueError, TypeError):
+            return value
+
+        if self._is_empty(target_value):
+            return None
+        if isinstance(target_value, str) and target_value.strip().startswith("="):
+            return self._resolve_formula_reference(target_value, depth + 1)
+        return str(target_value)
 
     def _load_workbook(self):
         if self._workbook is None:
@@ -162,7 +208,10 @@ class ExcelImageReviewer:
                 if self._is_empty(cell.value):
                     continue
 
-                value = str(cell.value)
+                value = self._resolve_formula_reference(cell.value)
+                if self._is_empty(value):
+                    continue
+                value = str(value)
                 cell_record = {
                     "coord": cell.coordinate,
                     "row": row,
@@ -204,68 +253,280 @@ class ExcelImageReviewer:
         min_row, max_row = region["min_row"], region["max_row"]
         min_col, max_col = region["min_col"], region["max_col"]
 
-        header_row = min_row
+        header_row = None
         mapped_columns = {}
+        anchor_fields = {"control_id", "control_description", "test_result", "conclusion", "exception_flag"}
+        best_score = 0
 
-        for col in range(min_col, max_col + 1):
-            label = cell_map.get((header_row, col))
-            field = self._map_schema_field(label)
-            if field:
-                mapped_columns[col] = field
+        for row in range(min_row, max_row + 1):
+            row_mapping = {}
+            used_fields = set()
+            for col in range(min_col, max_col + 1):
+                label = cell_map.get((row, col))
+                field = self._map_schema_field(label)
+                if field and field not in used_fields:
+                    row_mapping[col] = field
+                    used_fields.add(field)
+            score = len(row_mapping)
+            if score < 2:
+                continue
+            if not (used_fields & anchor_fields):
+                continue
+            if score > best_score:
+                header_row = row
+                mapped_columns = row_mapping
+                best_score = score
 
-        if len(mapped_columns) < 2:
+        if not header_row or len(mapped_columns) < 2:
             return []
 
         records = []
+        row_context = {}
+        row_context_cells = {}
         for row in range(header_row + 1, max_row + 1):
             record = {field: None for field in STANDARD_SCHEMA_FIELDS}
             source_cells = {}
-            has_value = False
+            has_direct_value = False
 
             for col, field in mapped_columns.items():
                 value = cell_map.get((row, col))
                 if not self._is_empty(value):
                     record[field] = value
                     source_cells[field] = f"{openpyxl.utils.get_column_letter(col)}{row}"
-                    has_value = True
+                    has_direct_value = True
 
-            if has_value:
-                record["sample_id"] = f"{region['region_id']}-{row}"
-                record["source_cells"] = source_cells
-                records.append(record)
+            if not has_direct_value:
+                continue
+
+            for field in CONTEXT_CARRY_FIELDS:
+                if self._is_empty(record[field]) and field in row_context:
+                    record[field] = row_context[field]
+                    if field in row_context_cells and field not in source_cells:
+                        source_cells[field] = row_context_cells[field]
+
+            for field in CONTEXT_CARRY_FIELDS:
+                if not self._is_empty(record[field]):
+                    row_context[field] = record[field]
+                    if field in source_cells:
+                        row_context_cells[field] = source_cells[field]
+
+            record["sample_id"] = f"{region['region_id']}-{row}"
+            record["source_cells"] = source_cells
+            records.append(record)
 
         return records
 
-    def _extract_from_key_value_region(self, region, cell_map):
+    def _extract_from_key_value_region(self, region, cell_map, sheet_max_col=None):
         min_row, max_row = region["min_row"], region["max_row"]
         min_col, max_col = region["min_col"], region["max_col"]
+        max_search_col = max_col if sheet_max_col is None else max(max_col, sheet_max_col)
 
         record = {field: None for field in STANDARD_SCHEMA_FIELDS}
         source_cells = {}
-        mapped_count = 0
+        mapped_fields = set()
 
         for row in range(min_row, max_row + 1):
-            for col in range(min_col, max_col):
+            for col in range(min_col, max_col + 1):
                 label = cell_map.get((row, col))
                 field = self._map_schema_field(label)
                 if not field:
                     continue
 
                 value_col = col + 1
-                while value_col <= max_col and self._is_empty(cell_map.get((row, value_col))):
+                while value_col <= max_search_col and self._is_empty(cell_map.get((row, value_col))):
                     value_col += 1
-                if value_col <= max_col:
+                if value_col <= max_search_col:
                     value = cell_map.get((row, value_col))
                     if not self._is_empty(value):
                         record[field] = value
                         source_cells[field] = f"{openpyxl.utils.get_column_letter(value_col)}{row}"
-                        mapped_count += 1
+                        mapped_fields.add(field)
 
-        if mapped_count < 2:
+        mapped_count = len(mapped_fields)
+        if mapped_count < 1:
+            return []
+        # Some workpapers split labels into tiny one-line KV regions; allow
+        # single-field anchor records so downstream context carry can stitch
+        # surrounding metadata together.
+        if mapped_count == 1 and not (
+            mapped_fields
+            & {"control_id", "control_description", "test_result", "exception_flag", "conclusion"}
+        ):
             return []
 
         record["sample_id"] = f"{region['region_id']}-KV"
         record["source_cells"] = source_cells
+        return [record]
+
+    def _extract_from_step_block_region(self, region, cell_map):
+        min_row, max_row = region["min_row"], region["max_row"]
+        min_col, max_col = region["min_col"], region["max_col"]
+
+        header_row = None
+        step_col = None
+        standard_col = None
+        execution_cols = []
+
+        for row in range(min_row, max_row + 1):
+            row_step_col = None
+            row_standard_col = None
+            row_execution_cols = []
+
+            for col in range(min_col, max_col + 1):
+                label = str(cell_map.get((row, col)) or "").strip()
+                normalized = self._normalize_text(label)
+                if not normalized:
+                    continue
+
+                if "测试步骤" in normalized:
+                    row_step_col = col
+                if "标准审计程序" in normalized:
+                    row_standard_col = col
+                if "执行" in normalized and "审计程序" in normalized and "标准" not in normalized:
+                    row_execution_cols.append(col)
+
+            if row_step_col and row_standard_col and row_execution_cols:
+                header_row = row
+                step_col = row_step_col
+                standard_col = row_standard_col
+                execution_cols = sorted(set(row_execution_cols))
+                break
+
+        if not header_row or not standard_col or not execution_cols:
+            return []
+
+        conclusion_row = None
+        detail_rows = []
+        for row in range(header_row + 1, max_row + 1):
+            marker = str(cell_map.get((row, step_col)) or "").strip()
+            marker_normalized = self._normalize_text(marker)
+            if "测试结论" in marker_normalized:
+                conclusion_row = row
+                break
+
+            standard_text = str(cell_map.get((row, standard_col)) or "").strip()
+            execution_has_value = any(str(cell_map.get((row, col)) or "").strip() for col in execution_cols)
+            if standard_text or execution_has_value:
+                detail_rows.append(row)
+
+        if not detail_rows:
+            return []
+
+        standard_text_lines = []
+        standard_source_cells = []
+        for row in detail_rows:
+            standard_text = str(cell_map.get((row, standard_col)) or "").strip()
+            if not standard_text:
+                continue
+            marker = str(cell_map.get((row, step_col)) or "").strip()
+            if marker.isdigit():
+                standard_text_lines.append(f"{marker}. {standard_text}")
+            else:
+                standard_text_lines.append(standard_text)
+            standard_source_cells.append(f"{openpyxl.utils.get_column_letter(standard_col)}{row}")
+
+        records = []
+        for col in execution_cols:
+            exec_text_lines = []
+            exec_source_cells = []
+
+            for row in detail_rows:
+                exec_text = str(cell_map.get((row, col)) or "").strip()
+                if not exec_text:
+                    continue
+                marker = str(cell_map.get((row, step_col)) or "").strip()
+                if marker.isdigit():
+                    exec_text_lines.append(f"{marker}. {exec_text}")
+                else:
+                    exec_text_lines.append(exec_text)
+                exec_source_cells.append(f"{openpyxl.utils.get_column_letter(col)}{row}")
+
+            conclusion_value = None
+            conclusion_cell = None
+            if conclusion_row:
+                maybe_conclusion = str(cell_map.get((conclusion_row, col)) or "").strip()
+                if maybe_conclusion:
+                    conclusion_value = maybe_conclusion
+                    conclusion_cell = f"{openpyxl.utils.get_column_letter(col)}{conclusion_row}"
+
+            if not exec_text_lines and not conclusion_value:
+                continue
+
+            record = {field: None for field in STANDARD_SCHEMA_FIELDS}
+            if standard_text_lines:
+                record["audit_procedure"] = "\n".join(standard_text_lines)
+            if exec_text_lines:
+                record["test_steps"] = "\n".join(exec_text_lines)
+            if conclusion_value:
+                record["conclusion"] = conclusion_value
+
+            source_cells = {}
+            if standard_source_cells:
+                source_cells["audit_procedure"] = ",".join(standard_source_cells)
+            if exec_source_cells:
+                source_cells["test_steps"] = ",".join(exec_source_cells)
+            if conclusion_cell:
+                source_cells["conclusion"] = conclusion_cell
+
+            record["source_cells"] = source_cells
+            record["sample_id"] = f"{region['region_id']}-STEP-{openpyxl.utils.get_column_letter(col)}"
+            records.append(record)
+
+        return records
+
+    def _extract_from_question_answer_layout(self, structure, cell_map):
+        max_row = structure.get("max_row", 0)
+        max_col = structure.get("max_column", 0)
+        qa_pairs = []
+
+        for row in range(1, max_row + 1):
+            row_values = []
+            for col in range(1, max_col + 1):
+                value = cell_map.get((row, col))
+                if self._is_empty(value):
+                    continue
+                row_values.append((col, str(value).strip()))
+
+            if len(row_values) < 2:
+                continue
+
+            question_col, question = row_values[0]
+            answer_col, answer = row_values[1]
+            if self._is_empty(question) or self._is_empty(answer):
+                continue
+            if question in {"问题", "question"} and answer in {"回答", "answer"}:
+                continue
+
+            qa_pairs.append((row, question_col, question, answer_col, answer))
+
+        if not qa_pairs:
+            return []
+
+        record = {field: None for field in STANDARD_SCHEMA_FIELDS}
+        record["sample_id"] = "R0-QA"
+        record["audit_procedure"] = "\n".join(
+            f"{idx}. {question}" for idx, (_, _, question, _, _) in enumerate(qa_pairs, start=1)
+        )
+        record["test_steps"] = "\n".join(
+            f"{idx}. {answer}" for idx, (_, _, _, _, answer) in enumerate(qa_pairs, start=1)
+        )
+
+        if any(any(hint in answer for hint in QA_POSITIVE_RESULT_HINTS) for _, _, _, _, answer in qa_pairs):
+            record["test_result"] = "未见异常"
+
+        question_cells = []
+        answer_cells = []
+        for row, question_col, _, answer_col, _ in qa_pairs:
+            question_cells.append(f"{openpyxl.utils.get_column_letter(question_col)}{row}")
+            answer_cells.append(f"{openpyxl.utils.get_column_letter(answer_col)}{row}")
+
+        record["source_cells"] = {
+            "audit_procedure": ",".join(question_cells),
+            "test_steps": ",".join(answer_cells),
+        }
+        if record["test_result"]:
+            record["source_cells"]["test_result"] = ",".join(answer_cells)
+
         return [record]
 
     def map_sheet_to_schema(self, sheet_name):
@@ -286,10 +547,36 @@ class ExcelImageReviewer:
                 schema_records.extend(tabular_records)
                 continue
 
-            kv_records = self._extract_from_key_value_region(region, cell_map)
+            step_records = self._extract_from_step_block_region(region, cell_map)
+            if step_records:
+                schema_records.extend(step_records)
+
+            kv_records = self._extract_from_key_value_region(
+                region,
+                cell_map,
+                sheet_max_col=structure.get("max_column", region["max_col"]),
+            )
             if kv_records:
                 schema_records.extend(kv_records)
 
+        context_values = {}
+        context_cells = {}
+        for record in schema_records:
+            source_cells = record.setdefault("source_cells", {})
+            for field in CONTEXT_CARRY_FIELDS:
+                value = record.get(field)
+                if self._is_empty(value):
+                    if field in context_values:
+                        record[field] = context_values[field]
+                        if field in context_cells and field not in source_cells:
+                            source_cells[field] = context_cells[field]
+                    continue
+                context_values[field] = value
+                if field in source_cells:
+                    context_cells[field] = source_cells[field]
+
+        if not schema_records:
+            schema_records = self._extract_from_question_answer_layout(structure, cell_map)
         self.sheet_schema_records[sheet_name] = schema_records
         return schema_records
 
@@ -308,8 +595,156 @@ class ExcelImageReviewer:
                 "table_regions": structure.get("table_regions", []),
             },
             "schema_records": schema_records,
-            "cell_excerpt": structure.get("cells", [])[:200],
         }
+
+    def _resolve_excerpt_from_location(self, location, schema_records):
+        sample_ids = re.findall(r"R[0-9A-Za-z-]+", location or "")
+        mentioned_fields = [field for field in STANDARD_SCHEMA_FIELDS if field in (location or "")]
+
+        candidates = []
+        if sample_ids:
+            for record in schema_records:
+                record_sample = str(record.get("sample_id") or "")
+                tokens = [token.strip() for token in record_sample.split(",") if token.strip()]
+                if any(sample_id in tokens for sample_id in sample_ids):
+                    candidates.append(record)
+        if not candidates:
+            candidates = list(schema_records)
+
+        field_priority = mentioned_fields or [
+            "test_steps",
+            "audit_procedure",
+            "test_result",
+            "conclusion",
+            "exception_flag",
+            "sample_selection_method",
+            "sample_size",
+            "control_description",
+            "control_id",
+        ]
+
+        if mentioned_fields and candidates:
+            has_non_null = False
+            for record in candidates:
+                for field in mentioned_fields:
+                    if not self._is_empty(record.get(field)):
+                        has_non_null = True
+                        break
+                if has_non_null:
+                    break
+            if not has_non_null:
+                return "null"
+
+        for record in candidates:
+            for field in field_priority:
+                value = record.get(field)
+                if self._is_empty(value):
+                    continue
+                snippet = re.sub(r"\s+", " ", str(value)).strip()
+                if snippet:
+                    return snippet[:220]
+        return None
+
+    def _excerpt_in_schema(self, excerpt, schema_text):
+        if not excerpt:
+            return True
+
+        def normalize(value):
+            return re.sub(r"\s+", " ", (value or "").strip())
+
+        cleaned = normalize(excerpt.replace("原文摘录:", ""))
+        cleaned = cleaned.strip("“”\"' ")
+        if cleaned and cleaned in schema_text:
+            return True
+
+        quoted = re.findall(r"[“\"]([^”\"]+)[”\"]", excerpt)
+        candidates = quoted or re.split(r"[；;。|,\n]+", cleaned)
+        for item in candidates:
+            token = normalize(item).strip("“”\"' ")
+            if len(token) >= 2 and token in schema_text:
+                return True
+        return False
+
+    @staticmethod
+    def _split_markdown_row(row_text):
+        stripped = (row_text or "").strip()
+        if not stripped.startswith("|"):
+            return None
+
+        core = stripped
+        if core.startswith("|"):
+            core = core[1:]
+        if core.endswith("|"):
+            core = core[:-1]
+
+        cells = [cell.strip().replace("\\|", "|") for cell in re.split(r"(?<!\\)\|", core)]
+        return cells
+
+    @staticmethod
+    def _is_markdown_separator_row(cells):
+        if not cells:
+            return False
+        compact = [re.sub(r"\s+", "", cell or "") for cell in cells]
+        return all(re.fullmatch(r":?-{3,}:?", cell or "") for cell in compact if cell)
+
+    @staticmethod
+    def _join_markdown_row(cells):
+        escaped = [str(cell).replace("|", r"\|") for cell in cells]
+        return f"| {' | '.join(escaped)} |"
+
+    def _enforce_issue_excerpt_traceability(self, review_markdown, schema_records):
+        if not review_markdown or not schema_records:
+            return review_markdown
+
+        schema_chunks = []
+        for record in schema_records:
+            for field in STANDARD_SCHEMA_FIELDS:
+                value = record.get(field)
+                if not self._is_empty(value):
+                    schema_chunks.append(re.sub(r"\s+", " ", str(value)).strip())
+        schema_text = "\n".join(schema_chunks)
+        if not schema_text:
+            return review_markdown
+
+        lines = review_markdown.splitlines()
+        in_issue_table = False
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if re.match(r"^\|\s*问题ID\s*\|", stripped):
+                in_issue_table = True
+                continue
+            if not in_issue_table:
+                continue
+            if not stripped.startswith("|"):
+                if stripped:
+                    in_issue_table = False
+                continue
+
+            cells = self._split_markdown_row(stripped)
+            if not cells:
+                continue
+            if len(cells) < 7:
+                continue
+            if self._is_markdown_separator_row(cells):
+                continue
+            if len(cells) > 7:
+                # Keep head/tail columns stable and fold ambiguous middle pipes
+                # into the "原文摘录" column.
+                cells = cells[:4] + [" | ".join(cells[4:-2])] + cells[-2:]
+
+            location = cells[3]
+            excerpt = cells[4]
+            if self._excerpt_in_schema(excerpt, schema_text):
+                continue
+
+            replacement = self._resolve_excerpt_from_location(location, schema_records)
+            if not replacement:
+                continue
+
+            cells[4] = replacement
+            lines[idx] = self._join_markdown_row(cells)
+
+        return "\n".join(lines)
 
     def review_structured_sheet(self, sheet_name):
         """Review a sheet using structured Excel content (no image recognition)."""
@@ -333,7 +768,7 @@ class ExcelImageReviewer:
             "至少输出1行；如果无问题，输出“未发现重大问题”，并给出“建议补充检查项”。\n\n"
             "## 需补充证据\n"
             "- 列出无法直接从当前底稿判断但影响结论可靠性的证据缺口。\n\n"
-            "定位必须引用字段名或 sample_id；原文摘录必须来自输入内容，不可编造。"
+            "定位必须引用字段名或 sample_id；原文摘录必须逐字来自 schema_records 中某个字段值，不可引用 schema_records 之外内容、不可编造。"
         )
 
         try:
@@ -357,7 +792,8 @@ class ExcelImageReviewer:
                 temperature=0.2,
                 timeout=180,
             )
-            return response.choices[0].message.content
+            raw_review = response.choices[0].message.content or ""
+            return self._enforce_issue_excerpt_traceability(raw_review, payload.get("schema_records", []))
         except Exception as exc:
             return f"Error reviewing structured sheet: {exc}"
 
@@ -512,20 +948,18 @@ class ExcelImageReviewer:
             doc.add_paragraph("未抽取到可映射标准 Schema 的记录。")
             return
 
-        preview = schema_records[:8]
         columns = ["sample_id"] + STANDARD_SCHEMA_FIELDS
         table = doc.add_table(rows=1, cols=len(columns))
         table.style = "Table Grid"
         for idx, col in enumerate(columns):
             table.rows[0].cells[idx].text = col
 
-        for record in preview:
+        for record in schema_records:
             row_cells = table.add_row().cells
             for idx, col in enumerate(columns):
-                row_cells[idx].text = str(record.get(col, "") or "")
-
-        if len(schema_records) > len(preview):
-            doc.add_paragraph(f"仅展示前 {len(preview)} 条，共 {len(schema_records)} 条。")
+                value = record.get(col)
+                # Keep falsy non-None values visible (0/False); only None is null.
+                row_cells[idx].text = "null" if value is None else str(value)
 
     def generate_report(self):
         """Generate a DOCX report based on structured extraction and LLM results."""
@@ -557,7 +991,7 @@ class ExcelImageReviewer:
                 merged_preview = ", ".join(item["range"] for item in merged_ranges[:10])
                 doc.add_paragraph(f"合并区域（预览）：{merged_preview}")
 
-            doc.add_heading("标准 Schema 抽取结果（预览）", level=3)
+            doc.add_heading("标准 Schema 抽取结果", level=3)
             self._append_schema_preview_table(doc, schema_records)
 
             doc.add_heading("审阅结果", level=3)

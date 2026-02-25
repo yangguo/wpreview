@@ -135,6 +135,48 @@ class ReportDocxTests(unittest.TestCase):
         self.assertIn("risk_impact", captured["prompt"])
         self.assertIn("问题清单", captured["prompt"])
 
+    def test_enforce_issue_excerpt_traceability_rewrites_unmatched_excerpt(self):
+        reviewer = self._reviewer()
+        schema_records = [
+            {
+                "sample_id": "R4-STEP-C",
+                "control_id": "SA-4c",
+                "test_steps": "1. 检查审批记录；2. 检查职责分离执行情况；3. 核对日志。",
+                "audit_procedure": "执行有效性标准审计程序",
+                "source_cells": {"test_steps": "C14,C15,C16"},
+            }
+        ]
+        review_markdown = (
+            "## 问题清单\n"
+            "|问题ID|问题类型|严重级别|定位（底稿字段/样本编号）|原文摘录|判定依据|整改建议|\n"
+            "|---|---|---|---|---|---|---|\n"
+            "|P-1|覆盖性|高|test_steps (R4-STEP-C)|测试步骤中未包含对职责分离的检查。|依据...|补充...|\n"
+        )
+
+        rewritten = reviewer._enforce_issue_excerpt_traceability(review_markdown, schema_records)
+        self.assertIn("检查职责分离执行情况", rewritten)
+        self.assertNotIn("测试步骤中未包含对职责分离的检查。", rewritten)
+
+    def test_enforce_issue_excerpt_traceability_uses_null_for_missing_field(self):
+        reviewer = self._reviewer()
+        schema_records = [
+            {
+                "sample_id": "R1-KV",
+                "control_id": "SA-3",
+                "sample_selection_method": None,
+                "source_cells": {},
+            }
+        ]
+        review_markdown = (
+            "## 问题清单\n"
+            "|问题ID|问题类型|严重级别|定位（底稿字段/样本编号）|原文摘录|判定依据|整改建议|\n"
+            "|---|---|---|---|---|---|---|\n"
+            "|P-2|方法性问题|中|sample_selection_method (R1-KV)|该字段在所有 schema_records 中均为 null|依据...|补充...|\n"
+        )
+
+        rewritten = reviewer._enforce_issue_excerpt_traceability(review_markdown, schema_records)
+        self.assertIn("| null |", rewritten)
+
 
 if __name__ == "__main__":
     unittest.main()
