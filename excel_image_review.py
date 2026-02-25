@@ -474,6 +474,90 @@ class ExcelImageReviewer:
 
         return records
 
+    def _extract_from_procedure_pair_layout(self, structure, cell_map):
+        """Extract row-level standard-vs-execution procedure pairs across the full sheet."""
+        max_row = structure.get("max_row", 0)
+        max_col = structure.get("max_column", 0)
+        records = []
+        seen_pairs = set()
+
+        for header_row in range(1, max_row + 1):
+            standard_cols = []
+            execution_cols = []
+
+            for col in range(1, max_col + 1):
+                normalized = self._normalize_text(cell_map.get((header_row, col)))
+                if not normalized:
+                    continue
+                if "标准审计程序" in normalized:
+                    standard_cols.append(col)
+                if "执行" in normalized and "审计程序" in normalized and "标准" not in normalized:
+                    execution_cols.append(col)
+
+            if not standard_cols or not execution_cols:
+                continue
+
+            for standard_col in standard_cols:
+                right_execution_cols = [col for col in execution_cols if col > standard_col]
+                if right_execution_cols:
+                    execution_col = min(right_execution_cols)
+                else:
+                    execution_col = min(execution_cols, key=lambda col: abs(col - standard_col))
+
+                for row in range(header_row + 1, max_row + 1):
+                    standard_text = str(cell_map.get((row, standard_col)) or "").strip()
+                    execution_text = str(cell_map.get((row, execution_col)) or "").strip()
+
+                    marker_text = ""
+                    if standard_col > 1:
+                        marker_text = str(cell_map.get((row, standard_col - 1)) or "").strip()
+
+                    marker_normalized = self._normalize_text(marker_text)
+                    standard_normalized = self._normalize_text(standard_text)
+                    if any(token in marker_normalized for token in ("测试结论", "样本记录", "缺陷评估")):
+                        break
+                    if any(token in standard_normalized for token in ("测试结论", "样本记录", "缺陷评估")):
+                        break
+
+                    if not standard_text and not execution_text:
+                        continue
+
+                    if any(token in standard_normalized for token in ("审计证据", "样本总量", "抽样数量", "审计期间")):
+                        continue
+                    if any(token in standard_normalized for token in ("测试步骤", "标准审计程序")):
+                        continue
+                    if "执行的审计程序" in self._normalize_text(execution_text):
+                        continue
+
+                    if not standard_text or not execution_text:
+                        continue
+
+                    standard_coord = f"{openpyxl.utils.get_column_letter(standard_col)}{row}"
+                    execution_coord = f"{openpyxl.utils.get_column_letter(execution_col)}{row}"
+                    pair_key = (standard_coord, execution_coord)
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
+
+                    if marker_text.isdigit():
+                        standard_value = f"{marker_text}. {standard_text}"
+                        execution_value = f"{marker_text}. {execution_text}"
+                    else:
+                        standard_value = standard_text
+                        execution_value = execution_text
+
+                    record = {field: None for field in STANDARD_SCHEMA_FIELDS}
+                    record["sample_id"] = f"R0-PAIR-{openpyxl.utils.get_column_letter(execution_col)}{row}"
+                    record["audit_procedure"] = standard_value
+                    record["test_steps"] = execution_value
+                    record["source_cells"] = {
+                        "audit_procedure": standard_coord,
+                        "test_steps": execution_coord,
+                    }
+                    records.append(record)
+
+        return records
+
     def _extract_from_question_answer_layout(self, structure, cell_map):
         max_row = structure.get("max_row", 0)
         max_col = structure.get("max_column", 0)
@@ -529,6 +613,59 @@ class ExcelImageReviewer:
 
         return [record]
 
+    @staticmethod
+    def _extract_coords(coord_value):
+        if coord_value is None:
+            return []
+        raw = str(coord_value)
+        tokens = [item.strip() for item in raw.split(",") if item.strip()]
+        coords = []
+        for token in tokens:
+            match = re.match(r"^([A-Za-z]+)(\d+)$", token)
+            if not match:
+                continue
+            col = openpyxl.utils.column_index_from_string(match.group(1).upper())
+            row = int(match.group(2))
+            coords.append((row, col))
+        return coords
+
+    def _record_sort_key(self, record):
+        source_cells = record.get("source_cells", {}) or {}
+        coord_candidates = []
+
+        for field in ["audit_procedure", "test_steps", "sample_size", "conclusion", "test_result", "exception_flag"]:
+            coord_candidates.extend(self._extract_coords(source_cells.get(field)))
+
+        if not coord_candidates:
+            for value in source_cells.values():
+                coord_candidates.extend(self._extract_coords(value))
+
+        if coord_candidates:
+            row, col = min(coord_candidates)
+            return (row, col, str(record.get("sample_id") or ""))
+
+        sample_id = str(record.get("sample_id") or "")
+        sample_row_match = re.search(r"-(\d+)$", sample_id)
+        fallback_row = int(sample_row_match.group(1)) if sample_row_match else 10**9
+        return (fallback_row, 10**9, sample_id)
+
+    def _prune_incomplete_procedure_rows(self, schema_records):
+        if not schema_records:
+            return schema_records
+
+        has_complete_pair = any(
+            not self._is_empty(record.get("audit_procedure")) and not self._is_empty(record.get("test_steps"))
+            for record in schema_records
+        )
+        if not has_complete_pair:
+            return schema_records
+
+        return [
+            record
+            for record in schema_records
+            if not self._is_empty(record.get("audit_procedure")) and not self._is_empty(record.get("test_steps"))
+        ]
+
     def map_sheet_to_schema(self, sheet_name):
         """Map extracted table content to the standard audit workpaper schema."""
         if sheet_name not in self.sheet_structures:
@@ -559,6 +696,8 @@ class ExcelImageReviewer:
             if kv_records:
                 schema_records.extend(kv_records)
 
+        schema_records.extend(self._extract_from_procedure_pair_layout(structure, cell_map))
+
         context_values = {}
         context_cells = {}
         for record in schema_records:
@@ -577,6 +716,8 @@ class ExcelImageReviewer:
 
         if not schema_records:
             schema_records = self._extract_from_question_answer_layout(structure, cell_map)
+        schema_records = self._prune_incomplete_procedure_rows(schema_records)
+        schema_records = sorted(schema_records, key=self._record_sort_key)
         self.sheet_schema_records[sheet_name] = schema_records
         return schema_records
 

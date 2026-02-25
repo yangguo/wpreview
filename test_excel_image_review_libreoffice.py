@@ -82,6 +82,33 @@ class StructuredExtractionTests(unittest.TestCase):
         ws_step["A9"] = "是否发现异常"
         ws_step["B9"] = "Yes"
 
+        ws_pair = wb.create_sheet("PairRows")
+        ws_pair["A4"] = "设计有效性标准审计程序"
+        ws_pair["C4"] = "设计有效性执行的审计程序"
+        ws_pair["A5"] = "检查制度文件是否存在"
+        ws_pair["C5"] = "已获取并检查制度文件"
+        ws_pair["A6"] = "审计证据"
+        ws_pair["C6"] = "制度文件索引"
+        ws_pair["A7"] = "设计有效性测试结论"
+        ws_pair["C7"] = "有效"
+        ws_pair["A13"] = "测试步骤"
+        ws_pair["B13"] = "执行有效性标准审计程序"
+        ws_pair["C13"] = "执行有效性执行的审计程序"
+        ws_pair["A14"] = "1"
+        ws_pair["B14"] = "步骤一"
+        ws_pair["C14"] = "执行一"
+        ws_pair["A15"] = "2"
+        ws_pair["B15"] = "步骤二"
+        ws_pair["C15"] = "执行二"
+        ws_pair["A16"] = "3"
+        ws_pair["B16"] = "步骤三"
+        ws_pair["C16"] = "执行三"
+        ws_pair["A17"] = "4"
+        ws_pair["B17"] = "步骤四"
+        ws_pair["C17"] = "执行四"
+        ws_pair["A18"] = "执行有效性测试结论"
+        ws_pair["C18"] = "有效"
+
         wb.save(self.excel_path)
 
     def _build_reviewer(self):
@@ -190,7 +217,32 @@ class StructuredExtractionTests(unittest.TestCase):
         self.assertTrue(any("访谈管理员并检查审批单据" in (record.get("test_steps") or "") for record in records))
         self.assertTrue(any("检查审批记录" in (record.get("audit_procedure") or "") for record in records))
         self.assertTrue(any(record.get("conclusion") == "无效" for record in records))
-        self.assertTrue(any(record.get("exception_flag") == "Yes" for record in records))
+        self.assertTrue(all(record.get("audit_procedure") for record in records))
+        self.assertTrue(all(record.get("test_steps") for record in records))
+
+    @patch("excel_image_review.OpenAI", new=DummyOpenAIClient)
+    def test_map_sheet_to_schema_extracts_procedure_pairs_by_row(self):
+        reviewer = self._build_reviewer()
+        reviewer.extract_sheet_structure("PairRows")
+        records = reviewer.map_sheet_to_schema("PairRows")
+
+        pair_sources = {
+            (r.get("source_cells", {}).get("audit_procedure"), r.get("source_cells", {}).get("test_steps"))
+            for r in records
+        }
+        self.assertIn(("A5", "C5"), pair_sources)
+        self.assertIn(("B15", "C15"), pair_sources)
+        self.assertIn(("B16", "C16"), pair_sources)
+        self.assertIn(("B17", "C17"), pair_sources)
+
+        row_order = []
+        for record in records:
+            source = record.get("source_cells", {})
+            coord = source.get("audit_procedure") or source.get("test_steps") or ""
+            first_coord = coord.split(",")[0]
+            row_order.append(int("".join(ch for ch in first_coord if ch.isdigit())))
+        self.assertEqual(row_order, sorted(row_order))
+        self.assertTrue(all(record.get("audit_procedure") and record.get("test_steps") for record in records))
 
 
 if __name__ == "__main__":
