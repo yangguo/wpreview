@@ -144,3 +144,5 @@ dmypy.json
 # Excel review output
 output/
 *.xlsx
+
+*.txt
