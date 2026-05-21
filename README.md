@@ -60,13 +60,6 @@ python excel_image_review.py path/to/file.xlsx -o output_dir -m gpt-4o
 - `output/<sheet_name>_structured.json` (structured extraction payload)
 - `output/review_report.docx` (review report)
 
-使用示例数据（脚本会生成一个示例 Excel）：
-
-```bash
-python create_sample_excel.py
-python excel_image_review.py path/to/sample_data.xlsx
-```
-
 以代码方式调用：
 
 ```python
@@ -85,6 +78,7 @@ report_path = reviewer.generate_report()
 - 基于“检查要点.xlsx”对指定 Sheet 做要点复核（存在问题/不确定则入“问题清单”）
 - 对“标准审计程序 vs 执行审计程序”做对应性检查（汇总与问题明细在“LLM对应性”页签）
 - 对“问题清单”进行二次复核，补充 LLM 结论字段
+- （可选）结合“审计证据预览描述/图片描述”清单，对附件引用匹配、证据-步骤一致性、要点复核进行增强判断
 
 ### 基本用法
 
@@ -107,25 +101,38 @@ OPENAI_BASE_URL=https://your-host/v1
 OPENAI_MODEL=gpt-4o
 ```
 
+可选运行参数（环境变量）：
+
+```bash
+LLM_TIMEOUT=90
+LLM_EVIDENCE_STEPS_MAX_ITEMS=30
+```
+
+说明：
+- `LLM_TIMEOUT`：单次 LLM 请求超时（秒）
+- `LLM_EVIDENCE_STEPS_MAX_ITEMS`：当“证据-步骤一致性”匹配到的记录很多时，可限制 LLM 复核条数（0 表示不限制）
+
 ### 参数说明
 
 ```text
   -i, --input            待复核的底稿Excel路径（.xlsx）
   -o, --output           输出报告路径（.xlsx 或 .txt）
   -k, --checkpoints      检查要点Excel路径（.xlsx，可选）
+  --attachments-preview  审计证据预览描述Excel路径（含“图片描述/目录索引”等，可选）
   -s, --sheets           指定只检查的Sheet（控制点页签），逗号/空格分隔（可选）
 ```
 
 ### 输出说明（Excel 报告）
 
 当 `--output` 以 `.xlsx` 结尾时，输出报告包含以下页签：
-- `汇总`：基本信息（输入文件/检查要点/本次检查范围）与统计汇总
+- `汇总`：基本信息、问题统计、关键角色候选、LLM调用统计与对应性统计
 - `问题清单`：逐条问题列表（含 Sheet/单元格定位、原文摘录、判定依据、整改建议）
-- `LLM对应性`：对应性检查统计 + 问题明细（不包含“全量结果”明细；无冻结窗格）
+- `LLM对应性`：对应性检查统计 + 问题明细（不包含”全量结果”明细；无冻结窗格）
 
 说明：
 - “关键角色候选”已合并进 `汇总` 页签，不再单独输出页签。
 - `-k/--checkpoints` 不传时，不做“检查要点”复核；其余复核仍会执行。
+- 若 `--attachments-preview` 的相对目录/相对路径中包含 `SA-10` 这类标记，脚本会将其作为该控制点的证据池，用于减少“已提供证据但底稿未写明附件编号/文件名”导致的误判。
 
 ### 示例
 
@@ -147,13 +154,30 @@ python analyze_excel.py -i "path\to\workpaper.xlsx" -o "path\to\excel_analysis_r
 python analyze_excel.py -i "path\to\workpaper.xlsx" -o "path\to\excel_analysis_report_SA4c_SA5.xlsx" -k "path\to\检查要点.xlsx" -s "SA-4c,SA-5"
 ```
 
+4) 只检查 SA-10，并结合审计证据预览描述
+
+```bash
+python analyze_excel.py -i "path\to\workpaper.xlsx" -o "path\to\sa10_report.xlsx" -k "path\to\检查要点.xlsx" -s "SA-10" --attachments-preview "path\to\审计证据_预览描述.xlsx"
+```
+
+PowerShell 里设置环境变量并运行：
+
+```powershell
+$env:LLM_TIMEOUT="90"
+$env:LLM_EVIDENCE_STEPS_MAX_ITEMS="30"
+python analyze_excel.py -i "path\to\workpaper.xlsx" -o "path\to\sa10_report.xlsx" -k "path\to\检查要点.xlsx" -s "SA-10" --attachments-preview "path\to\审计证据_预览描述.xlsx"
+```
+
 ## 项目结构
 
 ```text
 ├── excel_image_review.py                  # 主脚本（结构化审阅）
-├── create_sample_excel.py                 # 示例数据生成
+├── analyze_excel.py                       # ITGC底稿复核（LLM辅助）
+├── review_audit_findings.py               # 审计发现质量审阅（参考问题库）
+├── 底稿复核设计部份.py                     # 审计程序对应性检查
 ├── test_excel_review.py                   # 端到端（mock）测试
 ├── test_excel_image_review_libreoffice.py # 结构/schema 单元测试
+├── test_excel_image_review_report_docx.py # DOCX报告单元测试
 └── requirements.txt
 ```
 
