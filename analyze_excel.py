@@ -1866,7 +1866,7 @@ def _llm_judge_procedure_pair(
             reason = answer.split("理由:", 1)[1].strip()
         else:
             reason = answer
-        reason = str(reason or "").lstrip("】").lstrip().lstrip("】").lstrip()
+        reason = str(reason or "").strip("】 \t\n\r").strip()
         return True, is_match, reason, answer
     except Exception as e:
         return False, None, str(e), ""
@@ -2192,116 +2192,165 @@ def _safe_cell_text(value: Optional[str], limit: int = 30000) -> str:
     if value is None:
         return ""
     s = str(value).replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ").strip()
-    s = s.lstrip("】").lstrip()
+    s = s.strip("】").strip()
     if len(s) <= limit:
         return s
     return s[:limit] + "..."
 
 
-def _llm_merge_cell_duplicates(
-    *,
-    client,
-    model: str,
-    combined_rows: List[Dict[str, object]],
-) -> List[Dict[str, object]]:
-    """Merge rows that share the same (sheet, cell) into a single consolidated row via LLM."""
-    if client is None:
-        return combined_rows
 
-    # Group by (sheet, cell), skipping rows without a valid cell
-    groups: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+
+def _merge_cell_duplicates(
+    combined_rows,
+    *,
+    client=None,
+    model="",
+):
+    """Merge rows that share the same (sheet, cell). LLM-first, deterministic fallback."""
+    groups = {}
     for idx, row_data in enumerate(combined_rows):
         sheet = str(row_data.get("sheet", "")).strip()
         c = str(row_data.get("cell", "")).strip()
         if sheet and c and c != "-":
-            groups[(sheet, c)].append(idx)
+            groups.setdefault((sheet, c), []).append(idx)
 
     dup_keys = [(k, idxs) for k, idxs in groups.items() if len(idxs) >= 2]
     if not dup_keys:
         return combined_rows
 
-    # Merge each group via LLM
-    merged_map: Dict[int, Dict[str, object]] = {}  # first idx -> merged row
-    removed_indices: set = set()
-    merge_failures = 0
+    removed_indices = set()
+    llm_ok = 0
+    llm_fail = 0
 
     for (sheet, cell), idxs in dup_keys:
         items = [combined_rows[i] for i in idxs]
-        system_prompt = (
-            "你是一名IT审计底稿复核专家。同一个单元格被多个检查维度标记了问题，"
-            "请将这些重复/相似的问题条目合并为一条，去除冗余内容。\n"
-            "要求：\n"
-            "1) 如果多条问题本质描述同一件事，合并issue和basis，保留最完整的描述。\n"
-            "2) severity取最严重的一条（高 > 中 > 低）。\n"
-            "3) source统一写为\"多维度合并\"。\n"
-            "4) 输出严格JSON，格式: {\"results\": [{\"issue\": \"合并后的问题描述\", \"basis\": \"合并后的判定依据\", \"suggestion\": \"合并后的整改建议\", \"severity\": \"高/中/低\"}]}\n"
-            "5) results数组中只包含一个元素，即合并后的结果。\n"
-            "6) 不要输出多余文本。"
-        )
-        items_json = []
-        for i, it in enumerate(items, start=1):
-            items_json.append({
-                "id": i,
-                "source": str(it.get("source", "")),
-                "severity": str(it.get("severity", "")),
-                "issue": str(it.get("issue", "")),
-                "basis": str(it.get("basis", "")),
-                "suggestion": str(it.get("suggestion", "")),
-            })
-        user_prompt = (
-            f"Sheet: {sheet}  单元格: {cell}\n\n"
-            f"请合并以下{len(items)}条问题：\n{json.dumps(items_json, ensure_ascii=False, indent=2)}"
-        )
+        merged = None
+        if client is not None:
+            merged = _try_llm_merge_cell(client, model, sheet, cell, items)
+        if merged is not None:
+            llm_ok += 1
+        else:
+            if client is not None:
+                llm_fail += 1
+            merged = _deterministic_merge_cell(items)
 
-        parsed, _ = _llm_request_json_list(
-            client=client,
-            model=model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            stage="merge_cell_duplicates",
-            max_attempts=2,
-        )
-        merged = parsed[0] if parsed and isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], dict) else None
-        if merged is None:
-            merge_failures += 1
-            _llm_stat("merge_cell_duplicates", "error_merge", 1)
-            continue
-
-        first_idx = idxs[0]
-        merged_map[first_idx] = {
+        combined_rows[idxs[0]] = {
             "sheet": sheet,
-            "source": "多维度合并",
-            "severity": str(merged.get("severity", items[0].get("severity", "中"))),
-            "issue": str(merged.get("issue", items[0].get("issue", ""))),
             "cell": cell,
-            "row": str(items[0].get("row", "")),
-            "standard_cell": str(items[0].get("standard_cell", "")),
-            "execution_cell": str(items[0].get("execution_cell", "")),
-            "execution_label": str(items[0].get("execution_label", "")),
-            "excerpt": str(items[0].get("excerpt", "")),
-            "basis": str(merged.get("basis", items[0].get("basis", ""))),
-            "suggestion": str(merged.get("suggestion", items[0].get("suggestion", ""))),
+            "excerpt": max((str(it.get("excerpt", "")) for it in items), key=len),
             "llm": items[0].get("llm", {}),
+            **merged,
         }
         for i in idxs[1:]:
             removed_indices.add(i)
 
-    if not merged_map:
+    if not removed_indices:
         return combined_rows
 
-    if merge_failures > 0:
-        print(f"警告: {merge_failures} 个单元格合并失败（LLM调用异常），保留原始条目", flush=True)
-
-    result: List[Dict[str, object]] = []
+    result = []
     for idx, row_data in enumerate(combined_rows):
         if idx in removed_indices:
             continue
-        if idx in merged_map:
-            result.append(merged_map[idx])
-        else:
-            result.append(row_data)
+        result.append(row_data)
 
+    parts = [f"{len(dup_keys)} 组合并 => 减少 {len(removed_indices)} 条"]
+    if llm_ok > 0:
+        parts.append(f"LLM合并{llm_ok}组")
+    if llm_fail > 0:
+        parts.append(f"规则合并{llm_fail}组")
+    print(f"同单元格合并: {'，'.join(parts)}", flush=True)
     return result
+
+
+def _deterministic_merge_cell(items):
+    sev_rank = {"高": 0, "中": 1, "低": 2}
+    best_sev = "中"
+    best_r = 999
+    for it in items:
+        r = sev_rank.get(str(it.get("severity", "中")), 9)
+        if r < best_r:
+            best_r = r
+            best_sev = str(it.get("severity", "中"))
+
+    seen = set()
+    issue_parts = []
+    for it in items:
+        v = str(it.get("issue", "")).strip()
+        if v and v not in seen:
+            seen.add(v)
+            issue_parts.append(v)
+
+    sources = sorted({str(it.get("source", "")).strip() for it in items if str(it.get("source", "")).strip()})
+
+    seen_b = set()
+    basis_parts = []
+    for it in items:
+        v = str(it.get("basis", "")).strip()
+        if v and v not in seen_b:
+            seen_b.add(v)
+            basis_parts.append(v)
+
+    seen_s = set()
+    sug_parts = []
+    for it in items:
+        v = str(it.get("suggestion", "")).strip()
+        if v and v not in seen_s:
+            seen_s.add(v)
+            sug_parts.append(v)
+
+    return {
+        "source": " + ".join(sources) if sources else "多维度合并",
+        "severity": best_sev,
+        "issue": "；".join(issue_parts),
+        "basis": "\n---\n".join(basis_parts),
+        "suggestion": "\n".join(sug_parts),
+    }
+
+
+def _try_llm_merge_cell(client, model, sheet, cell, items):
+    sp = (
+        "你是一名IT审计底稿复核专家。请将同一单元格的多条问题合并为一条，去除冗余。\n\n"
+        "合并规则：\n"
+        "1) 本质相同的多条问题 → 合并issue和basis，保留最完整的描述\n"
+        "2) severity取最严重的一条（高 > 中 > 低）\n"
+        "3) 合并后source写为\"多维度合并\"\n\n"
+        "你必须只输出一行JSON，格式如下（不要Markdown、不要解释）：\n"
+        '{"results":[{"issue":"合并后问题描述","basis":"合并后判定依据","suggestion":"合并后整改建议","severity":"高"}]}'
+    )
+    items_json = [{"id": i, "source": str(it.get("source", "")), "severity": str(it.get("severity", "")),
+                   "issue": str(it.get("issue", "")), "basis": str(it.get("basis", "")),
+                   "suggestion": str(it.get("suggestion", ""))} for i, it in enumerate(items, start=1)]
+    up = f"Sheet: {sheet}  单元格: {cell}\n\n请合并以下{len(items)}条问题：\n{json.dumps(items_json, ensure_ascii=False, indent=2)}"
+    try:
+        parsed, last_err = _llm_request_json_list(client=client, model=model, system_prompt=sp,
+                                                    user_prompt=up, stage="merge_cell_duplicates", max_attempts=2)
+        if parsed and isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], dict):
+            m = parsed[0]
+            return {"source": "多维度合并", "severity": str(m.get("severity", items[0].get("severity", "中"))),
+                    "issue": str(m.get("issue", items[0].get("issue", ""))),
+                    "basis": str(m.get("basis", items[0].get("basis", ""))),
+                    "suggestion": str(m.get("suggestion", items[0].get("suggestion", "")))}
+        # Fallback: try to extract JSON from raw response via _llm_chat
+        if last_err and "非JSON" in str(last_err):
+            raw = _llm_chat(client=client, model=model, messages=[
+                {"role": "system", "content": sp},
+                {"role": "user", "content": up},
+            ], stage="merge_cell_duplicates", max_attempts=1, temperature=0.05, max_tokens=512)
+            data = _try_parse_json(raw)
+            if isinstance(data, dict):
+                data = data.get("results") or data.get("data") or data
+            if isinstance(data, dict) and "issue" in data:
+                return {"source": "多维度合并", "severity": str(data.get("severity", items[0].get("severity", "中"))),
+                        "issue": str(data.get("issue", items[0].get("issue", ""))),
+                        "basis": str(data.get("basis", items[0].get("basis", ""))),
+                        "suggestion": str(data.get("suggestion", items[0].get("suggestion", "")))}
+        if last_err:
+            print(f"  LLM合并失败({sheet}/{cell}): {last_err[:120]}", flush=True)
+    except Exception as e:
+        print(f"  LLM合并异常({sheet}/{cell}): {str(e)[:120]}", flush=True)
+    return None
+
+
 
 
 def _write_report_txt(
@@ -2453,7 +2502,7 @@ def _write_report_xlsx(
     llm_ac_report: Optional[Dict[str, object]] = None,
     *,
     client=None,
-    model: str = "gpt-4o",
+    model: str,
 ) -> None:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font
@@ -2593,10 +2642,6 @@ def _write_report_xlsx(
         "严重级别",
         "问题类型/结果",
         "单元格",
-        "行号",
-        "标准单元格",
-        "执行单元格",
-        "执行对象",
         "原文全文",
         "判定依据/理由",
         "整改建议",
@@ -2610,7 +2655,7 @@ def _write_report_xlsx(
         cell.alignment = Alignment(vertical="top")
     ws_issues.freeze_panes = "A2"
 
-    widths = [14, 12, 10, 28, 10, 8, 12, 12, 14, 70, 70, 60]
+    widths = [14, 12, 10, 28, 10, 70, 70, 60]
     if llm_results is not None and include_llm_review_cols:
         widths.extend([12, 14, 70, 50, 50])
     for idx, w in enumerate(widths, start=1):
@@ -2629,10 +2674,6 @@ def _write_report_xlsx(
                 "severity": item.severity,
                 "issue": item.issue_type,
                 "cell": item.cell or "-",
-                "row": "",
-                "standard_cell": "",
-                "execution_cell": "",
-                "execution_label": "",
                 "excerpt": _full_excerpt(item.sheet, item.cell, item.snippet),
                 "basis": _safe_cell_text(item.basis),
                 "suggestion": _safe_cell_text(item.suggestion),
@@ -2661,10 +2702,6 @@ def _write_report_xlsx(
                         "severity": sev,
                         "issue": f"A-C对应性：{result}" if result else "A-C对应性：问题",
                         "cell": str(it.get("execution_cell", "") or "").strip() or "-",
-                        "row": str(it.get("row", "") or "").strip(),
-                        "standard_cell": str(it.get("standard_cell", "") or "").strip(),
-                        "execution_cell": str(it.get("execution_cell", "") or "").strip(),
-                        "execution_label": str(it.get("execution_label", "") or "").strip(),
                         "excerpt": _full_excerpt(
                             str(it.get("sheet", "") or "").strip(),
                             str(it.get("execution_cell", "") or "").strip(),
@@ -2685,18 +2722,22 @@ def _write_report_xlsx(
         src_wb = None
 
     # Merge duplicate issues pointing to the same cell within the same sheet
-    combined_rows = _llm_merge_cell_duplicates(
-        client=client,
-        model=model,
-        combined_rows=combined_rows,
-    )
+    combined_rows = _merge_cell_duplicates(combined_rows, client=client, model=model)
+
+    def _cell_sort_key(cell):
+        if not cell or cell == "-":
+            return ("Z", 10**9)
+        first = cell.split(",")[0].strip().upper()
+        m = re.match(r"^([A-Z]+)(\d+)$", first)
+        if not m:
+            return ("Z", 10**9)
+        return (m.group(1), int(m.group(2)))
 
     combined_rows.sort(
-        key=lambda r: (
-            str(r.get("sheet", "")),
-            _sev_rank(str(r.get("severity", ""))),
-            str(r.get("source", "")),
-            str(r.get("issue", "")),
+        key=lambda rd: (
+            str(rd.get("sheet", "")),
+            _cell_sort_key(str(rd.get("cell", ""))),
+            _sev_rank(str(rd.get("severity", ""))),
         )
     )
 
@@ -2731,28 +2772,22 @@ def _write_report_xlsx(
             row_data.get("severity", ""),
             row_data.get("issue", ""),
             row_data.get("cell", ""),
-            row_data.get("row", ""),
-            row_data.get("standard_cell", ""),
-            row_data.get("execution_cell", ""),
-            row_data.get("execution_label", ""),
             row_data.get("excerpt", ""),
             row_data.get("basis", ""),
             row_data.get("suggestion", ""),
         ]
         if llm_results is not None and include_llm_review_cols:
             llm = row_data.get("llm") if isinstance(row_data.get("llm"), dict) else {}
-            row.extend(
-                [
-                    str(llm.get("llm_validity", "")),
-                    str(llm.get("llm_severity", "")),
-                    str(llm.get("llm_comment", "")),
-                    str(llm.get("llm_missing_evidence", "")),
-                    str(llm.get("llm_next_actions", "")),
-                ]
-            )
+            row.extend([
+                str(llm.get("llm_validity", "")),
+                str(llm.get("llm_severity", "")),
+                str(llm.get("llm_comment", "")),
+                str(llm.get("llm_missing_evidence", "")),
+                str(llm.get("llm_next_actions", "")),
+            ])
         for cc, value in enumerate(row, start=1):
             cell = ws_issues.cell(row=rr, column=cc, value=value)
-            if cc >= 10:
+            if cc >= 6:
                 cell.alignment = wrap
             else:
                 cell.alignment = Alignment(vertical="top")
