@@ -3586,77 +3586,65 @@ def _write_report_xlsx(
     header_font = Font(bold=True)
 
     ws_sum = wb.create_sheet("汇总")
-    ws_sum.column_dimensions["A"].width = 20
-    ws_sum.column_dimensions["B"].width = 52
-    ws_sum.column_dimensions["C"].width = 20
-    ws_sum.column_dimensions["D"].width = 42
-    ws_sum.column_dimensions["E"].width = 10
+    ws_sum.column_dimensions["A"].width = 16
+    ws_sum.column_dimensions["B"].width = 60
 
     # ── 标题 ──
-    ws_sum.merge_cells("A1:D1")
+    ws_sum.merge_cells("A1:B1")
     title_cell = ws_sum["A1"]
     title_cell.value = "IT一般控制测试底稿复核报告"
     title_cell.font = Font(bold=True, size=14)
 
     # ── 基本信息 ──
     r = 3
-    ws_sum.merge_cells(f"A{r}:D{r}")
+    ws_sum.merge_cells(f"A{r}:B{r}")
     ws_sum[f"A{r}"] = "基本信息"
     ws_sum[f"A{r}"].font = Font(bold=True, size=11)
     r += 1
 
+    import os as _os
+    _short_name = _os.path.basename(excel_path) if excel_path else ""
     meta = [
         ("生成时间", started_at.strftime("%Y-%m-%d %H:%M:%S")),
-        ("文件路径", excel_path),
-        ("检查要点", checkpoints_path or "（未指定）"),
-        ("Sheet数量（本次/全量）", f"{len(target_sheets)} / {len(sheet_names)}"),
-        ("本次检查Sheet", ", ".join(target_sheets) if sheets_filter_applied else "全部"),
-        ("附件预览清单", attachments_preview_path or "（未指定）"),
+        ("文件", _short_name),
+        ("Sheet", f"{len(target_sheets)}/{len(sheet_names)}" + (f" ({', '.join(target_sheets)})" if sheets_filter_applied and len(target_sheets) <= 5 else (" (全部)" if not sheets_filter_applied else ""))),
         ("总问题数", str(len(findings_sorted))),
     ]
+    _summary_total_row = None
     for label, value in meta:
         ws_sum[f"A{r}"] = label
         ws_sum[f"B{r}"] = value
-        ws_sum[f"A{r}"].font = Font(bold=False)
-        ws_sum[f"B{r}"].alignment = wrap
+        if label == "总问题数":
+            _summary_total_row = r
         r += 1
 
     # ── 问题统计 ──
     r += 1
-    ws_sum.merge_cells(f"A{r}:D{r}")
+    ws_sum.merge_cells(f"A{r}:B{r}")
     ws_sum[f"A{r}"] = "问题统计"
     ws_sum[f"A{r}"].font = Font(bold=True, size=11)
     r += 1
 
-    # 严重级别
+    # 严重级别（单行）
+    _summary_sev_row = r
     ws_sum[f"A{r}"] = "严重级别"
-    ws_sum[f"B{r}"] = "数量"
-    ws_sum[f"A{r}"].font = header_font
-    ws_sum[f"B{r}"].font = header_font
-    r += 1
-    _summary_sev_start_row = r
+    sev_parts = []
     for sev, cnt in sorted(by_severity.items()):
-        ws_sum[f"A{r}"] = sev
-        ws_sum[f"B{r}"] = cnt
-        r += 1
+        sev_parts.append(f"{sev}: {cnt}")
+    ws_sum[f"B{r}"] = "  |  ".join(sev_parts) if sev_parts else "无"
+    r += 1
 
-    r += 1
     # Top问题类型
-    type_start = r
-    ws_sum.merge_cells(f"A{type_start}:D{type_start}")
-    ws_sum[f"A{type_start}"] = "Top问题类型"
-    ws_sum[f"A{type_start}"].font = Font(bold=True, size=11)
-    r += 1
     ws_sum[f"A{r}"] = "问题类型"
-    ws_sum[f"B{r}"] = "数量"
-    ws_sum[f"A{r}"].font = header_font
-    ws_sum[f"B{r}"].font = header_font
+    ws_sum[f"A{r}"].font = Font(bold=True)
     r += 1
     _summary_type_start_row = r
-    for issue_type, cnt in sorted(by_type.items(), key=lambda kv: (-kv[1], kv[0]))[:20]:
+    _summary_type_reserved_rows = 10
+    for issue_type, cnt in sorted(by_type.items(), key=lambda kv: (-kv[1], kv[0]))[:_summary_type_reserved_rows]:
         ws_sum[f"A{r}"] = issue_type
         ws_sum[f"B{r}"] = cnt
         r += 1
+    r = _summary_type_start_row + _summary_type_reserved_rows
 
     ws_issues = wb.create_sheet("问题清单")
     headers = [
@@ -3842,19 +3830,17 @@ def _write_report_xlsx(
     for row_data in combined_rows:
         merged_by_sev[_SEVERITY_DISPLAY.get(str(row_data.get("severity", "")), str(row_data.get("severity", "")))] += 1
         merged_by_typ[str(row_data.get("issue", ""))] += 1
-    ws_sum["B10"] = str(len(combined_rows))
-    r_upd = _summary_sev_start_row
-    for sev, cnt in sorted(merged_by_sev.items()):
-        ws_sum[f"A{r_upd}"] = sev
-        ws_sum[f"B{r_upd}"] = cnt
-        r_upd += 1
-    # Clear stale severity rows
-    while ws_sum[f"A{r_upd}"].value and str(ws_sum[f"A{r_upd}"].value).strip() in dict(by_severity):
-        ws_sum[f"A{r_upd}"] = ""
-        ws_sum[f"B{r_upd}"] = ""
-        r_upd += 1
+    # Update total issue count
+    ws_sum[f"B{_summary_total_row}"] = str(len(combined_rows))
+    # Update severity line (compact format)
+    sev_parts = [f"{sev}: {cnt}" for sev, cnt in sorted(merged_by_sev.items())]
+    ws_sum[f"B{_summary_sev_row}"] = "  |  ".join(sev_parts) if sev_parts else "无"
+    # Update top issue types in the reserved Top10 area.
+    for r_clear in range(_summary_type_start_row, _summary_type_start_row + _summary_type_reserved_rows):
+        ws_sum[f"A{r_clear}"] = ""
+        ws_sum[f"B{r_clear}"] = ""
     r_upd = _summary_type_start_row
-    for issue_type, cnt in sorted(merged_by_typ.items(), key=lambda kv: (-kv[1], kv[0]))[:20]:
+    for issue_type, cnt in sorted(merged_by_typ.items(), key=lambda kv: (-kv[1], kv[0]))[:_summary_type_reserved_rows]:
         ws_sum[f"A{r_upd}"] = issue_type
         ws_sum[f"B{r_upd}"] = cnt
         r_upd += 1
@@ -3894,51 +3880,157 @@ def _write_report_xlsx(
                 cell.alignment = Alignment(vertical="top")
         rr += 1
 
-    # ── 关键角色候选 ──
-    r += 2
-    ws_sum.merge_cells(f"A{r}:C{r}")
-    ws_sum[f"A{r}"] = "关键角色候选（便于联动复核）"
-    ws_sum[f"A{r}"].font = Font(bold=True, size=11)
-    r += 1
-    ws_sum[f"A{r}"] = "Sheet"
-    ws_sum[f"B{r}"] = "管理员候选"
-    ws_sum[f"C{r}"] = "执行/审批/复核人候选"
-    for col in ("A", "B", "C"):
-        ws_sum[f"{col}{r}"].font = header_font
-        ws_sum[f"{col}{r}"].alignment = Alignment(vertical="top")
-    ws_sum.column_dimensions["C"].width = 70
-    r += 1
+    # ── LLM对应性概要（汇总页只放摘要，明细放独立sheet）──
+    if llm_ac_report:
+        r += 1
+        ws_sum.merge_cells(f"A{r}:B{r}")
+        ws_sum[f"A{r}"] = "对应性检查"
+        ws_sum[f"A{r}"].font = Font(bold=True, size=11)
+        r += 1
 
-    roles_r = r
+        _ac_total = int(llm_ac_report.get("total", 0) or 0)
+        _ac_matched = int(llm_ac_report.get("matched", 0) or 0)
+        _ac_failed = int(llm_ac_report.get("failed", 0) or 0)
+        _ac_errors = int(llm_ac_report.get("api_errors", 0) or 0)
+        ws_sum[f"A{r}"] = "结果"
+        ws_sum[f"B{r}"] = f"总计 {_ac_total}  |  符合 {_ac_matched}  |  不符合 {_ac_failed}  |  API错误 {_ac_errors}"
+        r += 1
+
+        # ── LLM对应性明细 sheet ──
+        ws_ac = wb.create_sheet("LLM对应性")
+        ws_ac.column_dimensions["A"].width = 14
+        ws_ac.column_dimensions["B"].width = 8
+        ws_ac.column_dimensions["C"].width = 8
+        ws_ac.column_dimensions["D"].width = 14
+        ws_ac.column_dimensions["E"].width = 30
+        ws_ac.column_dimensions["F"].width = 10
+        ws_ac.column_dimensions["G"].width = 80
+        ws_ac.column_dimensions["H"].width = 10
+        ws_ac.column_dimensions["I"].width = 10
+
+        ws_ac["A1"] = "LLM对应性统计（标准审计程序 vs 执行审计程序）"
+        ws_ac["A1"].font = Font(bold=True, size=12)
+        ws_ac.merge_cells("A1:I1")
+        ws_ac["A2"] = "模型"
+        ws_ac["B2"] = str(llm_ac_report.get("model", ""))
+        ws_ac["A3"] = "接口"
+        ws_ac["B3"] = str(llm_ac_report.get("base_url", ""))
+
+        ac_pairs = [
+            ("总计检查", "total"),
+            ("符合", "matched"),
+            ("不符合/不确定", "failed"),
+            ("API错误", "api_errors"),
+            ("跳过（执行为空）", "skipped_c_empty"),
+            ("跳过（标准为空）", "skipped_a_empty"),
+            ("跳过（引用/编号）", "skipped_ref"),
+            ("跳过（标题/分类）", "skipped_header"),
+        ]
+        ac_r = 5
+        for label, key in ac_pairs:
+            ws_ac[f"A{ac_r}"] = label
+            ws_ac[f"B{ac_r}"] = int(llm_ac_report.get(key, 0) or 0)
+            ac_r += 1
+
+        ac_r += 1
+        ac_headers = ["Sheet", "检查", "符合", "不符合/不确定", "API错误", "执行空", "标准空", "引用", "标题"]
+        for c, h in enumerate(ac_headers, start=1):
+            cell = ws_ac.cell(row=ac_r, column=c, value=h)
+            cell.font = header_font
+        ac_r += 1
+
+        sheet_stats = llm_ac_report.get("sheet_stats") or {}
+        if isinstance(sheet_stats, dict):
+            for name, st in sheet_stats.items():
+                if not isinstance(st, dict):
+                    continue
+                ws_ac.cell(row=ac_r, column=1, value=str(name))
+                ws_ac.cell(row=ac_r, column=2, value=int(st.get("total", 0) or 0))
+                ws_ac.cell(row=ac_r, column=3, value=int(st.get("matched", 0) or 0))
+                ws_ac.cell(row=ac_r, column=4, value=int(st.get("failed", 0) or 0))
+                ws_ac.cell(row=ac_r, column=5, value=int(st.get("api_errors", 0) or 0))
+                ws_ac.cell(row=ac_r, column=6, value=int(st.get("skipped_c_empty", 0) or 0))
+                ws_ac.cell(row=ac_r, column=7, value=int(st.get("skipped_a_empty", 0) or 0))
+                ws_ac.cell(row=ac_r, column=8, value=int(st.get("skipped_ref", 0) or 0))
+                ws_ac.cell(row=ac_r, column=9, value=int(st.get("skipped_header", 0) or 0))
+                ac_r += 1
+
+        ac_issues = llm_ac_report.get("issues") or []
+        if isinstance(ac_issues, list) and ac_issues:
+            ac_r += 2
+            ws_ac.cell(row=ac_r, column=1, value="问题明细（不符合/API错误/不确定）").font = Font(bold=True, size=11)
+            ws_ac.merge_cells(start_row=ac_r, start_column=1, end_row=ac_r, end_column=7)
+            ac_r += 1
+            detail_headers = ["Sheet", "Row", "标准单元格", "执行单元格", "执行对象", "结果", "理由"]
+            for c, h in enumerate(detail_headers, start=1):
+                cell = ws_ac.cell(row=ac_r, column=c, value=h)
+                cell.font = header_font
+            ac_r += 1
+            for item in ac_issues:
+                if not isinstance(item, dict):
+                    continue
+                detail_row = [
+                    str(item.get("sheet", "")),
+                    str(item.get("row", "")),
+                    str(item.get("standard_cell", "")),
+                    str(item.get("execution_cell", "")),
+                    str(item.get("execution_label", "")),
+                    str(item.get("result", "")),
+                    _safe_cell_text_multiline(item.get("reason", ""), limit=2000),
+                ]
+                for c, value in enumerate(detail_row, start=1):
+                    cell = ws_ac.cell(row=ac_r, column=c, value=value)
+                    cell.alignment = wrap if c == 7 else Alignment(vertical="top")
+                ac_r += 1
+
+    # ── 关键角色候选（独立sheet）──
+    has_roles = False
     for sheet in ("SA-4c", "SA-5", "PM-5", "PM-6", "SA-12"):
-        if sheet not in actor_by_sheet:
-            continue
-        admins = sorted({token for _, token in actor_by_sheet[sheet].get("admins", [])})
-        executors = sorted({token for _, token in actor_by_sheet[sheet].get("executors", [])})
-        if not admins and not executors:
-            continue
-        ws_sum[f"A{roles_r}"] = sheet
-        ws_sum[f"B{roles_r}"] = ", ".join(admins)
-        ws_sum[f"C{roles_r}"] = ", ".join(executors)
-        ws_sum[f"B{roles_r}"].alignment = wrap
-        ws_sum[f"C{roles_r}"].alignment = wrap
-        roles_r += 1
-    r = max(roles_r, r)
+        if sheet in actor_by_sheet:
+            admins = actor_by_sheet[sheet].get("admins", [])
+            executors = actor_by_sheet[sheet].get("executors", [])
+            if admins or executors:
+                has_roles = True
+                break
+    if has_roles:
+        ws_roles = wb.create_sheet("角色候选")
+        ws_roles.column_dimensions["A"].width = 14
+        ws_roles.column_dimensions["B"].width = 40
+        ws_roles.column_dimensions["C"].width = 60
 
-    # ── LLM调用统计 ──
-    r += 1
-    llm_headers = ["阶段", "调用次数", "成功", "超时", "限流", "服务端", "解析", "上下文", "其他", "回退单条"]
-    ws_sum.merge_cells(f"A{r}:J{r}")
-    ws_sum[f"A{r}"] = "LLM调用统计"
-    ws_sum[f"A{r}"].font = Font(bold=True, size=11)
-    r += 1
-    for c, h in enumerate(llm_headers, start=1):
-        cell = ws_sum.cell(row=r, column=c, value=h)
-        cell.font = header_font
-        cell.alignment = Alignment(vertical="top")
-    r += 1
+        ws_roles["A1"] = "关键角色候选（便于联动复核）"
+        ws_roles["A1"].font = Font(bold=True, size=12)
+        ws_roles.merge_cells("A1:C1")
+        ws_roles["A2"] = "Sheet"
+        ws_roles["B2"] = "管理员候选"
+        ws_roles["C2"] = "执行/审批/复核人候选"
+        for col in ("A", "B", "C"):
+            ws_roles[f"{col}2"].font = header_font
 
+        roles_r = 3
+        for sheet in ("SA-4c", "SA-5", "PM-5", "PM-6", "SA-12"):
+            if sheet not in actor_by_sheet:
+                continue
+            admins = sorted({token for _, token in actor_by_sheet[sheet].get("admins", [])})
+            executors = sorted({token for _, token in actor_by_sheet[sheet].get("executors", [])})
+            if not admins and not executors:
+                continue
+            ws_roles[f"A{roles_r}"] = sheet
+            ws_roles[f"B{roles_r}"] = ", ".join(admins)
+            ws_roles[f"C{roles_r}"] = ", ".join(executors)
+            ws_roles[f"B{roles_r}"].alignment = wrap
+            ws_roles[f"C{roles_r}"].alignment = wrap
+            roles_r += 1
+
+    # ── LLM调用统计（独立sheet）──
     if isinstance(LLM_CALL_STATS, dict) and LLM_CALL_STATS:
+        ws_llm = wb.create_sheet("LLM调用统计")
+        llm_headers = ["阶段", "调用次数", "成功", "超时", "限流", "服务端", "解析", "上下文", "其他", "回退单条"]
+        for c, h in enumerate(llm_headers, start=1):
+            cell = ws_llm.cell(row=1, column=c, value=h)
+            cell.font = header_font
+
+        llm_r = 2
         for stage, st in sorted(LLM_CALL_STATS.items(), key=lambda kv: str(kv[0])):
             if not isinstance(st, dict):
                 continue
@@ -3955,63 +4047,8 @@ def _write_report_xlsx(
                 int(st.get("fallback_single", 0) or 0),
             ]
             for cc, v in enumerate(row_llm, start=1):
-                cell = ws_sum.cell(row=r, column=cc, value=v)
-                cell.alignment = Alignment(vertical="top")
-            r += 1
-
-    # ── LLM对应性统计 ──
-    if llm_ac_report:
-        r += 1
-        ws_sum.merge_cells(f"A{r}:D{r}")
-        ws_sum[f"A{r}"] = "LLM对应性统计（标准审计程序 vs 执行审计程序）"
-        ws_sum[f"A{r}"].font = Font(bold=True, size=11)
-        r += 1
-
-        ws_sum[f"A{r}"] = "模型"
-        ws_sum[f"B{r}"] = str(llm_ac_report.get("model", ""))
-        r += 1
-        ws_sum[f"A{r}"] = "接口"
-        ws_sum[f"B{r}"] = str(llm_ac_report.get("base_url", ""))
-        r += 1
-
-        pairs = [
-            ("总计检查", "total"),
-            ("符合", "matched"),
-            ("不符合/不确定", "failed"),
-            ("API错误", "api_errors"),
-            ("跳过（执行为空）", "skipped_c_empty"),
-            ("跳过（标准为空）", "skipped_a_empty"),
-            ("跳过（引用/编号）", "skipped_ref"),
-            ("跳过（标题/分类）", "skipped_header"),
-        ]
-        for label, key in pairs:
-            ws_sum[f"A{r}"] = label
-            ws_sum[f"B{r}"] = int(llm_ac_report.get(key, 0) or 0)
-            r += 1
-
-        r += 1
-        headers = ["Sheet", "检查", "符合", "不符合/不确定", "API错误", "执行空", "标准空", "引用", "标题"]
-        for c, h in enumerate(headers, start=1):
-            cell = ws_sum.cell(row=r, column=c, value=h)
-            cell.font = header_font
-            cell.alignment = Alignment(vertical="top")
-        r += 1
-
-        sheet_stats = llm_ac_report.get("sheet_stats") or {}
-        if isinstance(sheet_stats, dict):
-            for name, st in sheet_stats.items():
-                if not isinstance(st, dict):
-                    continue
-                ws_sum.cell(row=r, column=1, value=str(name)).alignment = Alignment(vertical="top")
-                ws_sum.cell(row=r, column=2, value=int(st.get("total", 0) or 0)).alignment = Alignment(vertical="top")
-                ws_sum.cell(row=r, column=3, value=int(st.get("matched", 0) or 0)).alignment = Alignment(vertical="top")
-                ws_sum.cell(row=r, column=4, value=int(st.get("failed", 0) or 0)).alignment = Alignment(vertical="top")
-                ws_sum.cell(row=r, column=5, value=int(st.get("api_errors", 0) or 0)).alignment = Alignment(vertical="top")
-                ws_sum.cell(row=r, column=6, value=int(st.get("skipped_c_empty", 0) or 0)).alignment = Alignment(vertical="top")
-                ws_sum.cell(row=r, column=7, value=int(st.get("skipped_a_empty", 0) or 0)).alignment = Alignment(vertical="top")
-                ws_sum.cell(row=r, column=8, value=int(st.get("skipped_ref", 0) or 0)).alignment = Alignment(vertical="top")
-                ws_sum.cell(row=r, column=9, value=int(st.get("skipped_header", 0) or 0)).alignment = Alignment(vertical="top")
-                r += 1
+                ws_llm.cell(row=llm_r, column=cc, value=v)
+            llm_r += 1
 
     wb.save(output_path)
 
