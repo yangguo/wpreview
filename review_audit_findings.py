@@ -8,8 +8,9 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import jsonschema
 import openpyxl
 
 
@@ -33,6 +34,229 @@ class ReferenceRow:
     issue_desc: str
     compensating_control: str
     risk_impact: str
+
+
+# ---------------------------------------------------------------------------
+# Severity mapping: internal P0/P1/P2 ↔ display 高/中/低
+# ---------------------------------------------------------------------------
+_SEVERITY_DISPLAY = {"P0": "高", "P1": "中", "P2": "低"}
+_SEVERITY_FROM_CHINESE = {"高": "P0", "中": "P1", "低": "P2"}
+
+# Maximum length for excerpt text in evidence_refs (kept consistent across scripts)
+# Used in two contexts:
+#   1. _repair_finding_result: constructing excerpts from snippet/basis (last-resort path)
+#   2. _verify_evidence_refs: replacing mismatched excerpts with actual cell text
+# 2000 chars preserves the full evidence content of a typical audit cell (~500 Chinese chars).
+_EXCERPT_MAX_LEN = 2000
+# When a repair-constructed excerpt comes from snippet/basis (not cell text), we
+# add this marker so the auditor knows it wasn't a verbatim excerpt from the source.
+_EXCERPT_CONSTRUCTED_MARKER = "[非逐字原文]"
+
+# ---------------------------------------------------------------------------
+# Unified Finding result JSON Schema — each LLM call that returns findings
+# should produce objects conforming to this schema.
+# ---------------------------------------------------------------------------
+_FINDING_RESULT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "required": ["status", "conclusion", "evidence_refs"],
+    "properties": {
+        "status": {"type": "string", "enum": ["pass", "fail", "unknown"]},
+        "conclusion": {"type": "string", "minLength": 4},
+        "reasons": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 5,
+        },
+        "evidence_refs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["cell_or_range"],
+                "properties": {
+                    "sheet": {"type": "string"},
+                    "cell_or_range": {"type": "string"},
+                    "attachment": {"type": "string"},
+                    "excerpt": {"type": "string"},
+                },
+            },
+        },
+        "severity": {"type": "string", "enum": ["P0", "P1", "P2"]},
+        "risk_type": {
+            "type": "string",
+            "enum": ["覆盖性", "一致性", "证据不足", "方法性", "逻辑性", "跨字段一致性"],
+        },
+        "fix_suggestion": {
+            "type": "object",
+            "properties": {
+                "missing_field": {"type": "string"},
+                "supplement_explanation": {"type": "string"},
+                "required_evidence_type": {"type": "string"},
+            },
+        },
+        "unknown_reason": {"type": "string"},
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Finding result validation & repair helpers (self-contained, not imported)
+# ---------------------------------------------------------------------------
+
+def _validate_finding_result(obj: Any, schema_records: Optional[List[dict]] = None) -> Tuple[bool, List[str]]:
+    """Validate a single finding dict against _FINDING_RESULT_SCHEMA.
+
+    Returns (valid, errors).  Beyond basic JSON Schema checks, enforces:
+    - status=="fail" ⇒ evidence_refs non-empty
+    - status=="unknown" ⇒ unknown_reason non-empty and ≥10 chars
+    - status!="pass" ⇒ severity and risk_type required
+    """
+    if not isinstance(obj, dict):
+        return False, ["result is not a dict"]
+    errors: List[str] = []
+    try:
+        jsonschema.validate(obj, _FINDING_RESULT_SCHEMA)
+    except jsonschema.ValidationError as exc:
+        errors.append(str(exc.message))
+
+    status = obj.get("status", "")
+    if status == "fail":
+        refs = obj.get("evidence_refs") or []
+        if not isinstance(refs, list) or len(refs) == 0:
+            errors.append("status=fail but evidence_refs is empty")
+    if status == "unknown":
+        reason = str(obj.get("unknown_reason", "")).strip()
+        if len(reason) < 10:
+            errors.append("status=unknown but unknown_reason is empty or <10 chars")
+    if status != "pass":
+        if not obj.get("severity"):
+            errors.append("status!=pass but severity is missing")
+        if not obj.get("risk_type"):
+            errors.append("status!=pass but risk_type is missing")
+    return (len(errors) == 0, errors)
+
+
+def _repair_finding_result(obj: Any, schema_records: Optional[List[dict]] = None) -> Optional[dict]:
+    """Attempt to fix common issues in a finding dict.
+
+    Returns repaired dict or None if unrepairable.
+    """
+    if not isinstance(obj, dict):
+        return None
+    repaired = dict(obj)
+
+    old_status = str(repaired.get("status", "")).strip()
+    if old_status == "无问题":
+        repaired["status"] = "pass"
+    elif old_status == "有问题":
+        repaired["status"] = "fail"
+    elif old_status == "不确定":
+        repaired["status"] = "unknown"
+
+    status = repaired.get("status", "fail")
+
+    sev = str(repaired.get("severity", "")).strip()
+    if sev in _SEVERITY_FROM_CHINESE:
+        repaired["severity"] = _SEVERITY_FROM_CHINESE[sev]
+    elif sev not in ("P0", "P1", "P2", ""):
+        repaired["severity"] = "P1"
+    if status != "pass" and not repaired.get("severity"):
+        repaired["severity"] = "P1"
+
+    if not repaired.get("conclusion"):
+        basis = str(repaired.get("basis", "")).strip()
+        if basis:
+            repaired["conclusion"] = basis[:200]
+        else:
+            repaired["conclusion"] = f"发现{status}类问题"
+
+    refs = repaired.get("evidence_refs")
+    if not isinstance(refs, list) or not refs:
+        constructed: List[dict] = []
+        related = repaired.get("related_cells") or repaired.get("cell") or ""
+        if isinstance(related, list):
+            cells = related
+        elif isinstance(related, str):
+            cells = [c.strip() for c in re.split(r"[,;，；\s]+", related) if c.strip()]
+        else:
+            cells = []
+        snippet_text = str(repaired.get("snippet", "") or repaired.get("basis", "")).strip()
+        for c in cells:
+            ref = {"cell_or_range": c}
+            if snippet_text:
+                ref["excerpt"] = snippet_text[:_EXCERPT_MAX_LEN]
+            constructed.append(ref)
+        if not constructed and snippet_text:
+            constructed.append({"cell_or_range": "", "excerpt": snippet_text[:_EXCERPT_MAX_LEN]})
+        # Tag constructed excerpts so auditors know they weren't from LLM output
+        for ref in constructed:
+            if isinstance(ref, dict) and ref.get("cell_or_range"):
+                ref["cell_or_range"] = str(ref.get("cell_or_range", "")) + _EXCERPT_CONSTRUCTED_MARKER
+        repaired["evidence_refs"] = constructed
+
+    # --- fail with empty evidence_refs ⇒ downgrade to unknown ---
+    if repaired.get("status") == "fail":
+        refs = repaired.get("evidence_refs") or []
+        if not isinstance(refs, list) or len(refs) == 0:
+            repaired["status"] = "unknown"
+            repaired["unknown_reason"] = "无法引用原始证据佐证该判定，降级为不确定"
+            repaired["severity"] = "P2"
+            status = "unknown"
+
+    if status != "pass" and not repaired.get("risk_type"):
+        repaired["risk_type"] = "证据不足"
+
+    if status == "unknown":
+        reason = str(repaired.get("unknown_reason", "")).strip()
+        if len(reason) < 10:
+            repaired["unknown_reason"] = "LLM未说明不确定原因：需要补充更多信息以判定"
+
+    if not repaired.get("reasons"):
+        basis = str(repaired.get("basis", "")).strip()
+        if basis:
+            repaired["reasons"] = [basis[:300]]
+        else:
+            repaired["reasons"] = [repaired.get("conclusion", "")]
+
+    if not repaired.get("fix_suggestion"):
+        sug = str(repaired.get("suggestion", "")).strip()
+        if sug:
+            repaired["fix_suggestion"] = {"supplement_explanation": sug[:300]}
+        else:
+            repaired["fix_suggestion"] = {}
+
+    return repaired
+
+
+def _validate_llm_results(
+    results_list: List[Any],
+    schema_records: Optional[List[dict]] = None,
+) -> Tuple[List[dict], bool]:
+    """Validate and repair a list of finding dicts.
+
+    Returns (valid_results, needs_retry).
+    If any result is unrepairable, needs_retry=True.
+    """
+    valid: List[dict] = []
+    needs_retry = False
+    for obj in results_list:
+        if not isinstance(obj, dict):
+            needs_retry = True
+            continue
+        ok, errors = _validate_finding_result(obj, schema_records)
+        if ok:
+            valid.append(obj)
+        else:
+            repaired = _repair_finding_result(obj, schema_records)
+            if repaired is not None:
+                ok2, _ = _validate_finding_result(repaired, schema_records)
+                if ok2:
+                    valid.append(repaired)
+                else:
+                    needs_retry = True
+            else:
+                needs_retry = True
+    return valid, needs_retry
 
 
 _WS = re.compile(r"\s+")
@@ -447,9 +671,15 @@ def _write_report(
         "建议风险及影响",
         "参考库匹配控制点",
         "参考库相似度",
+        "状态（LLM）",
+        "严重级别（LLM）",
+        "风险类型（LLM）",
+        "结论（LLM）",
         "问题点（LLM）",
         "建议补偿性控制（LLM）",
         "建议风险及影响（LLM）",
+        "整改建议(结构化)",
+        "不确定原因",
         "来源定位",
     ]
     ws.append(headers)
@@ -465,11 +695,33 @@ def _write_report(
         llm_issues = ""
         llm_comp = ""
         llm_risk = ""
+        llm_status = ""
+        llm_severity = ""
+        llm_risk_type = ""
+        llm_conclusion = ""
+        llm_fix = ""
+        llm_unknown = ""
         if llm_client and (llm_max_items <= 0 or idx <= llm_max_items):
             llm_payload = _llm_review_one(fr, reference_rows, llm_client)
             llm_issues = _norm(llm_payload.get("issues") or "")
             llm_comp = _norm(llm_payload.get("improved_compensating_control") or "")
             llm_risk = _norm(llm_payload.get("improved_risk_impact") or "")
+            llm_status = _norm(str(llm_payload.get("status") or ""))
+            raw_sev = _norm(str(llm_payload.get("severity") or ""))
+            llm_severity = _SEVERITY_DISPLAY.get(raw_sev, raw_sev)
+            llm_risk_type = _norm(str(llm_payload.get("risk_type") or ""))
+            llm_conclusion = _norm(str(llm_payload.get("conclusion") or ""))
+            llm_unknown = _norm(str(llm_payload.get("unknown_reason") or ""))
+            fix_obj = llm_payload.get("fix_suggestion") or {}
+            if isinstance(fix_obj, dict):
+                fix_parts = []
+                if fix_obj.get("missing_field"):
+                    fix_parts.append(f"缺: {str(fix_obj['missing_field'])[:200]}")
+                if fix_obj.get("supplement_explanation"):
+                    fix_parts.append(f"补: {str(fix_obj['supplement_explanation'])[:200]}")
+                if fix_obj.get("required_evidence_type"):
+                    fix_parts.append(f"需证据: {str(fix_obj['required_evidence_type'])[:200]}")
+                llm_fix = " | ".join(fix_parts)
         source = f"{findings_sheet}!R{fr.row_index}"
         ws.append(
             [
@@ -485,9 +737,15 @@ def _write_report(
                 risk_s,
                 ref.control_point if ref else "",
                 round(float(score), 3),
+                llm_status,
+                llm_severity,
+                llm_risk_type,
+                llm_conclusion,
                 llm_issues,
                 llm_comp,
                 llm_risk,
+                llm_fix,
+                llm_unknown,
                 source,
             ]
         )
@@ -506,10 +764,16 @@ def _write_report(
     ws.column_dimensions["H"].width = 36
     ws.column_dimensions["I"].width = 44
     ws.column_dimensions["J"].width = 44
-    ws.column_dimensions["M"].width = 36
-    ws.column_dimensions["N"].width = 44
-    ws.column_dimensions["O"].width = 44
-    ws.column_dimensions["P"].width = 28
+    ws.column_dimensions["M"].width = 12
+    ws.column_dimensions["N"].width = 12
+    ws.column_dimensions["O"].width = 16
+    ws.column_dimensions["P"].width = 36
+    ws.column_dimensions["Q"].width = 36
+    ws.column_dimensions["R"].width = 44
+    ws.column_dimensions["S"].width = 44
+    ws.column_dimensions["T"].width = 50
+    ws.column_dimensions["U"].width = 30
+    ws.column_dimensions["V"].width = 28
 
     wb.save(str(output_path))
 
@@ -718,7 +982,7 @@ def _llm_review_one(row: FindingRow, ref_rows: Sequence[ReferenceRow], client: _
     )
     system_prompt = (
         "你是一名资深IT审计质量复核专家。你要审阅一条审计发现是否逻辑一致、表述是否专业，并给出更好的补偿性控制与风险及影响描述。"
-        "要求：输出必须是JSON对象；用专业中文；不要输出多余文本。"
+        "要求：输出必须是严格JSON对象；用专业中文；不要输出多余文本。"
     )
     user_prompt = (
         f"【审计发现】\n"
@@ -730,14 +994,29 @@ def _llm_review_one(row: FindingRow, ref_rows: Sequence[ReferenceRow], client: _
         f"- 补偿性控制及有效性（原）：{_clip_text(row.compensating_control, 900)}\n"
         f"- 风险及影响（原）：{_clip_text(row.risk_impact, 900)}\n\n"
         f"【参考问题库片段】\n{hints_text or '(无)'}\n\n"
-        "请输出JSON，字段如下：\n"
+        "请输出严格JSON对象，字段如下：\n"
         '{\n'
+        '  "status": "pass"/"fail"/"unknown",\n'
+        '  "conclusion": "一句话结论",\n'
+        '  "reasons": ["要点1", "要点2"],\n'
+        '  "evidence_refs": [{"sheet": "...", "cell_or_range": "...", "excerpt": "..."}], \n'  # may be empty for this script
+        '  "severity": "P0"/"P1"/"P2",\n'
+        '  "risk_type": "覆盖性"/"一致性"/"证据不足"/"方法性"/"逻辑性"/"跨字段一致性",\n'
         '  "issues": "指出逻辑不一致/不专业点，尽量具体（可为空字符串）",\n'
-        '  "improved_compensating_control": "改写后的补偿性控制及有效性（可直接用于报告，避免写成审计人员执行步骤）",\n'
-        '  "improved_risk_impact": "改写后的风险及影响（风险机制+对财务报表/经营/合规的影响）"\n'
+        '  "improved_compensating_control": "改写后的补偿性控制及有效性",\n'
+        '  "improved_risk_impact": "改写后的风险及影响",\n'
+        '  "fix_suggestion": {"missing_field": "...", "supplement_explanation": "...", "required_evidence_type": "..."},\n'
+        '  "unknown_reason": "（status=unknown时必填，≥10字符）"\n'
         '}\n'
     )
-    return client.chat_json(system_prompt=system_prompt, user_prompt=user_prompt)
+    raw = client.chat_json(system_prompt=system_prompt, user_prompt=user_prompt)
+    if not isinstance(raw, dict):
+        return raw
+    # 验证 + 修复
+    valid, needs_retry = _validate_llm_results([raw], schema_records=None)
+    if valid:
+        return valid[0]
+    return raw
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

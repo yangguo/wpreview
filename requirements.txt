@@ -4,3 +4,4 @@ openpyxl
 python-docx
 markdown
 beautifulsoup4
+jsonschema>=4.0.0

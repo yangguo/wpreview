@@ -9,7 +9,9 @@ import sys
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
+import jsonschema
 import markdown
 import openpyxl
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -59,6 +61,275 @@ MIN_FUZZY_ALIAS_LEN = 3
 
 # Domain-specific phrases used to infer a positive/clean result in Q&A layouts.
 QA_POSITIVE_RESULT_HINTS = ("未见异常", "无异常")
+
+# ---------------------------------------------------------------------------
+# Severity mapping: internal P0/P1/P2 ↔ display 高/中/低
+# ---------------------------------------------------------------------------
+_SEVERITY_DISPLAY = {"P0": "高", "P1": "中", "P2": "低"}
+_SEVERITY_FROM_CHINESE = {"高": "P0", "中": "P1", "低": "P2"}
+
+# Maximum length for excerpt text in evidence_refs (kept consistent across scripts)
+# Used in two contexts:
+#   1. _repair_finding_result: constructing excerpts from snippet/basis (last-resort path)
+#   2. _verify_evidence_refs: replacing mismatched excerpts with actual cell text
+# 2000 chars preserves the full evidence content of a typical audit cell (~500 Chinese chars).
+_EXCERPT_MAX_LEN = 2000
+# When a repair-constructed excerpt comes from snippet/basis (not cell text), we
+# add this marker so the auditor knows it wasn't a verbatim excerpt from the source.
+_EXCERPT_CONSTRUCTED_MARKER = "[非逐字原文]"
+
+# ---------------------------------------------------------------------------
+# Unified Finding result JSON Schema — each LLM call that returns findings
+# should produce objects conforming to this schema.
+# ---------------------------------------------------------------------------
+_FINDING_RESULT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "required": ["status", "conclusion", "evidence_refs"],
+    "properties": {
+        "status": {"type": "string", "enum": ["pass", "fail", "unknown"]},
+        "conclusion": {"type": "string", "minLength": 4},
+        "reasons": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 5,
+        },
+        "evidence_refs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["cell_or_range"],
+                "properties": {
+                    "sheet": {"type": "string"},
+                    "cell_or_range": {"type": "string"},
+                    "attachment": {"type": "string"},
+                    "excerpt": {"type": "string"},
+                },
+            },
+        },
+        "severity": {"type": "string", "enum": ["P0", "P1", "P2"]},
+        "risk_type": {
+            "type": "string",
+            "enum": ["覆盖性", "一致性", "证据不足", "方法性", "逻辑性", "跨字段一致性"],
+        },
+        "fix_suggestion": {
+            "type": "object",
+            "properties": {
+                "missing_field": {"type": "string"},
+                "supplement_explanation": {"type": "string"},
+                "required_evidence_type": {"type": "string"},
+            },
+        },
+        "unknown_reason": {"type": "string"},
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Finding result validation & repair helpers (self-contained, not imported)
+# ---------------------------------------------------------------------------
+
+def _validate_finding_result(obj: Any, schema_records: Optional[List[dict]] = None) -> Tuple[bool, List[str]]:
+    """Validate a single finding dict against _FINDING_RESULT_SCHEMA.
+
+    Returns (valid, errors).  Beyond basic JSON Schema checks, enforces:
+    - status=="fail" ⇒ evidence_refs non-empty
+    - status=="unknown" ⇒ unknown_reason non-empty and ≥10 chars
+    - status!="pass" ⇒ severity and risk_type required
+    """
+    if not isinstance(obj, dict):
+        return False, ["result is not a dict"]
+    errors: List[str] = []
+    try:
+        jsonschema.validate(obj, _FINDING_RESULT_SCHEMA)
+    except jsonschema.ValidationError as exc:
+        errors.append(str(exc.message))
+
+    status = obj.get("status", "")
+    # fail must have evidence_refs
+    if status == "fail":
+        refs = obj.get("evidence_refs") or []
+        if not isinstance(refs, list) or len(refs) == 0:
+            errors.append("status=fail but evidence_refs is empty")
+    # unknown must have unknown_reason
+    if status == "unknown":
+        reason = str(obj.get("unknown_reason", "")).strip()
+        if len(reason) < 10:
+            errors.append("status=unknown but unknown_reason is empty or <10 chars")
+    # non-pass must have severity & risk_type
+    if status != "pass":
+        if not obj.get("severity"):
+            errors.append("status!=pass but severity is missing")
+        if not obj.get("risk_type"):
+            errors.append("status!=pass but risk_type is missing")
+    return (len(errors) == 0, errors)
+
+
+def _repair_finding_result(obj: Any, schema_records: Optional[List[dict]] = None) -> Optional[dict]:
+    """Attempt to fix common issues in a finding dict.
+
+    Returns repaired dict or None if unrepairable.
+    """
+    if not isinstance(obj, dict):
+        return None
+    repaired = dict(obj)
+
+    # --- status migration: 旧中文值 → pass/fail/unknown ---
+    old_status = str(repaired.get("status", "")).strip()
+    if old_status == "无问题":
+        repaired["status"] = "pass"
+    elif old_status == "有问题":
+        repaired["status"] = "fail"
+    elif old_status == "不确定":
+        repaired["status"] = "unknown"
+
+    status = repaired.get("status", "fail")
+
+    # --- severity migration: 高/中/低 → P0/P1/P2 ---
+    sev = str(repaired.get("severity", "")).strip()
+    if sev in _SEVERITY_FROM_CHINESE:
+        repaired["severity"] = _SEVERITY_FROM_CHINESE[sev]
+    elif sev not in ("P0", "P1", "P2", ""):
+        repaired["severity"] = "P1"
+    if status != "pass" and not repaired.get("severity"):
+        repaired["severity"] = "P1"
+
+    # --- conclusion: derive from basis if missing ---
+    if not repaired.get("conclusion"):
+        basis = str(repaired.get("basis", "")).strip()
+        if basis:
+            repaired["conclusion"] = basis[:200]
+        else:
+            repaired["conclusion"] = f"发现{status}类问题"
+
+    # --- evidence_refs: construct from related_cells + snippet if missing ---
+    refs = repaired.get("evidence_refs")
+    if not isinstance(refs, list) or not refs:
+        constructed: List[dict] = []
+        related = repaired.get("related_cells") or repaired.get("cell") or ""
+        if isinstance(related, list):
+            cells = related
+        elif isinstance(related, str):
+            cells = [c.strip() for c in re.split(r"[,;，；\s]+", related) if c.strip()]
+        else:
+            cells = []
+        snippet_text = str(repaired.get("snippet", "") or repaired.get("basis", "")).strip()
+        for c in cells:
+            ref = {"cell_or_range": c}
+            if snippet_text:
+                ref["excerpt"] = snippet_text[:_EXCERPT_MAX_LEN]
+            constructed.append(ref)
+        if not constructed and snippet_text:
+            constructed.append({"cell_or_range": "", "excerpt": snippet_text[:_EXCERPT_MAX_LEN]})
+        # Tag constructed excerpts so auditors know they weren't from LLM output
+        for ref in constructed:
+            if isinstance(ref, dict) and ref.get("cell_or_range"):
+                ref["cell_or_range"] = str(ref.get("cell_or_range", "")) + _EXCERPT_CONSTRUCTED_MARKER
+        repaired["evidence_refs"] = constructed
+
+    # --- fail with empty evidence_refs ⇒ downgrade to unknown ---
+    if repaired.get("status") == "fail":
+        refs = repaired.get("evidence_refs") or []
+        if not isinstance(refs, list) or len(refs) == 0:
+            repaired["status"] = "unknown"
+            repaired["unknown_reason"] = "无法引用原始证据佐证该判定，降级为不确定"
+            repaired["severity"] = "P2"
+            status = "unknown"
+
+    # --- risk_type: default if missing ---
+    if status != "pass" and not repaired.get("risk_type"):
+        repaired["risk_type"] = "证据不足"
+
+    # --- unknown_reason: auto-generate if missing ---
+    if status == "unknown":
+        reason = str(repaired.get("unknown_reason", "")).strip()
+        if len(reason) < 10:
+            repaired["unknown_reason"] = "LLM未说明不确定原因：需要补充更多信息以判定"
+
+    # --- reasons: derive from basis if missing ---
+    if not repaired.get("reasons"):
+        basis = str(repaired.get("basis", "")).strip()
+        if basis:
+            repaired["reasons"] = [basis[:300]]
+        else:
+            repaired["reasons"] = [repaired.get("conclusion", "")]
+
+    # --- fix_suggestion: derive from suggestion if missing ---
+    if not repaired.get("fix_suggestion"):
+        sug = str(repaired.get("suggestion", "")).strip()
+        if sug:
+            repaired["fix_suggestion"] = {"supplement_explanation": sug[:300]}
+        else:
+            repaired["fix_suggestion"] = {}
+
+    return repaired
+
+
+def _validate_llm_results(
+    results_list: List[Any],
+    schema_records: Optional[List[dict]] = None,
+) -> Tuple[List[dict], bool]:
+    """Validate and repair a list of finding dicts.
+
+    Returns (valid_results, needs_retry).
+    If any result is unrepairable, needs_retry=True.
+    """
+    valid: List[dict] = []
+    needs_retry = False
+    for obj in results_list:
+        if not isinstance(obj, dict):
+            needs_retry = True
+            continue
+        ok, errors = _validate_finding_result(obj, schema_records)
+        if ok:
+            valid.append(obj)
+        else:
+            repaired = _repair_finding_result(obj, schema_records)
+            if repaired is not None:
+                ok2, _ = _validate_finding_result(repaired, schema_records)
+                if ok2:
+                    valid.append(repaired)
+                else:
+                    needs_retry = True
+            else:
+                needs_retry = True
+    return valid, needs_retry
+
+
+def _excerpt_matches(excerpt: str, actual_text: str) -> bool:
+    """Check if excerpt is a substring of actual_text after normalisation."""
+    _WS_RE = re.compile(r"\s+")
+    _PUNCT_RE = re.compile(r"[^\w一-鿿]+", re.UNICODE)
+    norm_ex = _PUNCT_RE.sub("", _WS_RE.sub("", excerpt)).lower()
+    norm_at = _PUNCT_RE.sub("", _WS_RE.sub("", actual_text)).lower()
+    if not norm_ex or not norm_at:
+        return False
+    return norm_ex in norm_at
+
+
+def _verify_evidence_refs(evidence_refs: List[dict], ws) -> List[dict]:
+    """Verify evidence_refs excerpts match actual cell text; repair if possible."""
+    if not ws:
+        return evidence_refs
+    verified: List[dict] = []
+    for ref in evidence_refs:
+        if not isinstance(ref, dict):
+            continue
+        cell = ref.get("cell_or_range", "")
+        excerpt = ref.get("excerpt", "")
+        actual_text = ""
+        if cell:
+            try:
+                c = ws[cell]
+                val = c.value
+                actual_text = str(val).strip() if val is not None else ""
+            except Exception:
+                pass
+        if actual_text and _excerpt_matches(excerpt, actual_text):
+            verified.append(ref)
+        elif actual_text:
+            verified.append({**ref, "excerpt": actual_text[:220]})
+    return verified
 
 
 class ExcelImageReviewer:
@@ -888,9 +1159,131 @@ class ExcelImageReviewer:
         return "\n".join(lines)
 
     def review_structured_sheet(self, sheet_name):
-        """Review a sheet using structured Excel content (no image recognition)."""
+        """Review a sheet using structured Excel content (no image recognition).
+
+        Returns either a dict (structured JSON path) or a Markdown string
+        (legacy fallback).  Callers can detect via ``isinstance(result, dict)``.
+        """
         payload = self._build_sheet_review_payload(sheet_name)
 
+        # ---- 尝试结构化 JSON 路径 ----
+        json_result = self._try_review_structured_sheet_json(sheet_name, payload)
+        if json_result is not None:
+            return json_result
+
+        # ---- fallback: 旧 Markdown 路径 ----
+        return self._review_structured_sheet_markdown(sheet_name, payload)
+
+    def _try_review_structured_sheet_json(self, sheet_name, payload):
+        """Request JSON output conforming to the unified schema.  Returns dict or None."""
+        prompt = (
+            "你是IT审计底稿审阅专家。输入数据来自 openpyxl 对 Excel 的结构化读取，不是截图。\n"
+            "请按以下四个维度审阅：\n"
+            "A. 覆盖性：测试过程是否覆盖审计程序要求。\n"
+            "B. 方法性问题：识别如仅询问无证据、只测设计不测执行、抽样依据不清、样本量不足、无例外闭环、证据与结论不匹配。\n"
+            "C. 逻辑问题（内部自洽）：测试结果、结论、步骤之间矛盾。\n"
+            "D. 跨字段一致性：控制描述/审计程序/测试过程/测试结果/结论/例外标记/期间与样本日期。\n\n"
+            "输出要求：必须输出严格JSON对象，格式为：\n"
+            "{\n"
+            "  \"overview\": {\"coverage_status\": \"完整/部分覆盖/未覆盖\", "
+            "\"missing_points\": \"...\", \"risk_impact\": \"...\"},\n"
+            "  \"issues\": [\n"
+            "    {\n"
+            "      \"status\": \"fail\",\n"
+            "      \"conclusion\": \"一句话结论\",\n"
+            "      \"reasons\": [\"要点1\", \"要点2\"],\n"
+            "      \"evidence_refs\": [{\"sheet\": \"...\", \"cell_or_range\": \"...\", "
+            "\"attachment\": \"...\", \"excerpt\": \"...\"}],\n"
+            "      \"severity\": \"P0\",\n"
+            "      \"risk_type\": \"覆盖性\",\n"
+            "      \"fix_suggestion\": {\"missing_field\": \"...\", "
+            "\"supplement_explanation\": \"...\", \"required_evidence_type\": \"...\"}\n"
+            "    }\n"
+            "  ],\n"
+            "  \"evidence_gaps\": [\"...\"]\n"
+            "}\n\n"
+            "关键约束：\n"
+            "1) status=fail时必须至少1个evidence_ref，excerpt必须逐字来自schema_records中某个字段值\n"
+            "2) 无法引用原文时status必须为unknown，unknown_reason必填（≥10字符）\n"
+            "3) severity使用P0/P1/P2；risk_type从[覆盖性/一致性/证据不足/方法性/逻辑性/跨字段一致性]选一\n"
+            "4) 不要输出Markdown代码块"
+        )
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "你是严谨的IT审计底稿审阅专家，输出严格JSON结构化审阅结果。",
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"审阅对象: {sheet_name}\n\n"
+                            f"审阅要求:\n{prompt}\n\n"
+                            f"结构化输入(JSON):\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+                        ),
+                    },
+                ],
+                max_tokens=3000,
+                temperature=0.2,
+                timeout=180,
+            )
+            raw = (response.choices[0].message.content or "").strip()
+            parsed = self._try_parse_review_json(raw)
+            if parsed is None:
+                return None
+            # 验证 + 修复 issues
+            issues = parsed.get("issues") or []
+            valid_issues, needs_retry = _validate_llm_results(issues, payload.get("schema_records", []))
+            parsed["issues"] = valid_issues
+            # 对每个 issue 的 evidence_refs 做进一步验证
+            for issue in parsed["issues"]:
+                refs = issue.get("evidence_refs")
+                if isinstance(refs, list) and refs and self._workbook is not None:
+                    sheet_obj = self._workbook[sheet_name] if sheet_name in self._workbook.sheetnames else None
+                    if sheet_obj is not None:
+                        issue["evidence_refs"] = _verify_evidence_refs(refs, sheet_obj)
+            return parsed
+        except Exception:
+            return None
+
+    @staticmethod
+    def _try_parse_review_json(text):
+        """Robust JSON object parser; returns dict or None."""
+        if not text:
+            return None
+        s = text.strip()
+        # strip code fences if any
+        if s.startswith("```"):
+            s = re.sub(r"^```(?:json)?\s*", "", s)
+            s = re.sub(r"\s*```\s*$", "", s)
+        start = s.find("{")
+        if start < 0:
+            return None
+        candidate = s[start:]
+        # find balanced closing brace
+        depth = 0
+        end = -1
+        for i, ch in enumerate(candidate):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end < 0:
+            return None
+        try:
+            obj = json.loads(candidate[:end])
+        except Exception:
+            return None
+        return obj if isinstance(obj, dict) else None
+
+    def _review_structured_sheet_markdown(self, sheet_name, payload):
+        """Legacy Markdown review path — kept as fallback."""
         prompt = (
             "你是IT审计底稿审阅专家。输入数据来自 openpyxl 对 Excel 的结构化读取，不是截图。\n"
             "请按以下四个维度审阅：\n"
@@ -1084,6 +1477,106 @@ class ExcelImageReviewer:
                 print(f"[{sheet_name}] Error: {exc}")
                 self.sheet_reviews[sheet_name] = f"Error: {exc}"
 
+    def _append_structured_review_to_doc(self, doc, review):
+        """Render a structured review (dict) into the DOCX.
+
+        Expected structure::
+
+            {
+              "overview": {"coverage_status", "missing_points", "risk_impact"},
+              "issues": [
+                {
+                  "status", "conclusion", "reasons", "evidence_refs",
+                  "severity", "risk_type", "fix_suggestion",
+                  "unknown_reason"
+                }
+              ],
+              "evidence_gaps": [...]
+            }
+        """
+        if not isinstance(review, dict):
+            self._append_markdown_to_doc(doc, str(review))
+            return
+
+        overview = review.get("overview") or {}
+        if overview:
+            doc.add_paragraph()
+            doc.add_paragraph("【审阅总览】").runs[0].bold = True
+            for k, v in overview.items():
+                doc.add_paragraph(f"{k}: {v}")
+
+        issues = review.get("issues") or []
+        if issues:
+            doc.add_paragraph()
+            doc.add_paragraph(f"【问题清单】（共 {len(issues)} 项）").runs[0].bold = True
+            table = doc.add_table(rows=1, cols=8)
+            table.style = "Light Grid Accent 1"
+            hdr = table.rows[0].cells
+            headers = ["状态", "严重级别", "风险类型", "结论", "理由", "证据引用", "整改建议", "不确定原因"]
+            for i, h in enumerate(headers):
+                hdr[i].text = h
+            for issue in issues:
+                status = str(issue.get("status", ""))
+                severity = str(issue.get("severity", ""))
+                # severity → display
+                severity_disp = _SEVERITY_DISPLAY.get(severity, severity)
+                risk_type = str(issue.get("risk_type", ""))
+                conclusion = str(issue.get("conclusion", ""))
+                reasons = issue.get("reasons") or []
+                if isinstance(reasons, list):
+                    reasons_text = " | ".join(str(r) for r in reasons[:5])
+                else:
+                    reasons_text = str(reasons)
+                refs = issue.get("evidence_refs") or []
+                if isinstance(refs, list):
+                    refs_text_parts = []
+                    for r in refs[:5]:
+                        if not isinstance(r, dict):
+                            continue
+                        cell = r.get("cell_or_range", "")
+                        excerpt = (r.get("excerpt") or "")[:80]
+                        attachment = r.get("attachment", "")
+                        piece = cell or "(无坐标)"
+                        if excerpt:
+                            piece += f": {excerpt}"
+                        if attachment:
+                            piece += f" [附件: {attachment}]"
+                        refs_text_parts.append(piece)
+                    refs_text = "\n".join(refs_text_parts)
+                else:
+                    refs_text = ""
+                fix_sug = issue.get("fix_suggestion") or {}
+                if isinstance(fix_sug, dict):
+                    fix_parts = []
+                    if fix_sug.get("missing_field"):
+                        fix_parts.append(f"缺: {fix_sug['missing_field']}")
+                    if fix_sug.get("supplement_explanation"):
+                        fix_parts.append(f"补: {fix_sug['supplement_explanation'][:200]}")
+                    if fix_sug.get("required_evidence_type"):
+                        fix_parts.append(f"需证据: {fix_sug['required_evidence_type'][:100]}")
+                    fix_text = " | ".join(fix_parts)
+                else:
+                    fix_text = str(fix_sug)
+                unknown = str(issue.get("unknown_reason", ""))
+                row = table.add_row().cells
+                row[0].text = status
+                row[1].text = severity_disp
+                row[2].text = risk_type
+                row[3].text = conclusion[:300]
+                row[4].text = reasons_text[:400]
+                row[5].text = refs_text[:400]
+                row[6].text = fix_text[:400]
+                row[7].text = unknown[:200]
+        else:
+            doc.add_paragraph("未发现重大问题。")
+
+        gaps = review.get("evidence_gaps") or []
+        if gaps:
+            doc.add_paragraph()
+            doc.add_paragraph("【需补充证据】").runs[0].bold = True
+            for g in gaps:
+                doc.add_paragraph(f"• {g}")
+
     def _append_schema_preview_table(self, doc, schema_records):
         if not schema_records:
             doc.add_paragraph("未抽取到可映射标准 Schema 的记录。")
@@ -1136,7 +1629,10 @@ class ExcelImageReviewer:
             self._append_schema_preview_table(doc, schema_records)
 
             doc.add_heading("审阅结果", level=3)
-            self._append_markdown_to_doc(doc, review)
+            if isinstance(review, dict):
+                self._append_structured_review_to_doc(doc, review)
+            else:
+                self._append_markdown_to_doc(doc, review)
 
         report_path = self.output_dir / "review_report.docx"
         doc.save(str(report_path))

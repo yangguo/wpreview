@@ -1,27 +1,101 @@
 import os
 import re
 import argparse
+import dataclasses
 import json
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import jsonschema
 import openpyxl
 from openpyxl.utils import get_column_letter
+
+
+# ---------------------------------------------------------------------------
+# Severity mapping: internal P0/P1/P2 ↔ display 高/中/低
+# ---------------------------------------------------------------------------
+_SEVERITY_DISPLAY = {"P0": "高", "P1": "中", "P2": "低"}
+_SEVERITY_FROM_CHINESE = {"高": "P0", "中": "P1", "低": "P2"}
+
+# Maximum length for excerpt text in evidence_refs (kept consistent across scripts)
+# Used in two contexts:
+#   1. _repair_finding_result: constructing excerpts from snippet/basis (last-resort path)
+#   2. _verify_evidence_refs: replacing mismatched excerpts with actual cell text
+# 2000 chars preserves the full evidence content of a typical audit cell (~500 Chinese chars).
+_EXCERPT_MAX_LEN = 2000
+# When a repair-constructed excerpt comes from snippet/basis (not cell text), we
+# add this marker so the auditor knows it wasn't a verbatim excerpt from the source.
+_EXCERPT_CONSTRUCTED_MARKER = "[非逐字原文]"
+
+# ---------------------------------------------------------------------------
+# Unified Finding result JSON Schema — each LLM call that returns findings
+# should produce objects conforming to this schema.
+# ---------------------------------------------------------------------------
+_FINDING_RESULT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "required": ["status", "conclusion", "evidence_refs"],
+    "properties": {
+        "status": {"type": "string", "enum": ["pass", "fail", "unknown"]},
+        "conclusion": {"type": "string", "minLength": 4},
+        "reasons": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 5,
+        },
+        "evidence_refs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["cell_or_range"],
+                "properties": {
+                    "sheet": {"type": "string"},
+                    "cell_or_range": {"type": "string"},
+                    "attachment": {"type": "string"},
+                    "excerpt": {"type": "string"},
+                },
+            },
+        },
+        "severity": {"type": "string", "enum": ["P0", "P1", "P2"]},
+        "risk_type": {
+            "type": "string",
+            "enum": ["覆盖性", "一致性", "证据不足", "方法性", "逻辑性", "跨字段一致性"],
+        },
+        "fix_suggestion": {
+            "type": "object",
+            "properties": {
+                "missing_field": {"type": "string"},
+                "supplement_explanation": {"type": "string"},
+                "required_evidence_type": {"type": "string"},
+            },
+        },
+        "unknown_reason": {"type": "string"},
+    },
+}
 
 
 @dataclass(frozen=True)
 class Finding:
     issue_type: str
-    severity: str
+    severity: str  # 内部 P0/P1/P2，输出映射 高/中/低
     sheet: str
     cell: Optional[str]
     snippet: str
     basis: str
     suggestion: str
+    # --- 新增字段（均有默认值，向后兼容） ---
+    status: str = "fail"  # pass / fail / unknown
+    risk_type: str = ""  # 覆盖性 / 一致性 / 证据不足 / ...
+    evidence_refs: str = "[]"  # JSON string of list[dict]
+    conclusion: str = ""
+    reasons: str = "[]"  # JSON string of list[str]
+    fix_suggestion_detail: str = "{}"  # JSON string of dict
+    unknown_reason: str = ""
+    needs_review: bool = False
 
 
 @dataclass(frozen=True)
@@ -33,6 +107,450 @@ class AttachmentPreviewItem:
     file_type: str
     description: str
     status: str
+
+
+# ---------------------------------------------------------------------------
+# Finding result validation & repair helpers
+# ---------------------------------------------------------------------------
+
+def _validate_finding_result(obj: Any, schema_records: Optional[List[dict]] = None) -> Tuple[bool, List[str]]:
+    """Validate a single finding dict against _FINDING_RESULT_SCHEMA.
+
+    Returns (valid, errors).  Beyond basic JSON Schema checks, enforces:
+    - status=="fail" ⇒ evidence_refs non-empty
+    - status=="unknown" ⇒ unknown_reason non-empty and ≥10 chars
+    - status!="pass" ⇒ severity and risk_type required
+    """
+    if not isinstance(obj, dict):
+        return False, ["result is not a dict"]
+    errors: List[str] = []
+    try:
+        jsonschema.validate(obj, _FINDING_RESULT_SCHEMA)
+    except jsonschema.ValidationError as exc:
+        errors.append(str(exc.message))
+
+    status = obj.get("status", "")
+    # fail must have evidence_refs
+    if status == "fail":
+        refs = obj.get("evidence_refs") or []
+        if not isinstance(refs, list) or len(refs) == 0:
+            errors.append("status=fail but evidence_refs is empty")
+    # unknown must have unknown_reason
+    if status == "unknown":
+        reason = str(obj.get("unknown_reason", "")).strip()
+        if len(reason) < 10:
+            errors.append("status=unknown but unknown_reason is empty or <10 chars")
+    # non-pass must have severity & risk_type
+    if status != "pass":
+        if not obj.get("severity"):
+            errors.append("status!=pass but severity is missing")
+        if not obj.get("risk_type"):
+            errors.append("status!=pass but risk_type is missing")
+    return (len(errors) == 0, errors)
+
+
+def _repair_finding_result(obj: Any, schema_records: Optional[List[dict]] = None) -> Optional[dict]:
+    """Attempt to fix common issues in a finding dict.
+
+    Returns repaired dict or None if unrepairable.
+    """
+    if not isinstance(obj, dict):
+        return None
+    repaired = dict(obj)
+
+    # --- status migration: 旧中文值 → pass/fail/unknown ---
+    old_status = str(repaired.get("status", "")).strip()
+    if old_status == "无问题":
+        repaired["status"] = "pass"
+    elif old_status == "有问题":
+        repaired["status"] = "fail"
+    elif old_status == "不确定":
+        repaired["status"] = "unknown"
+    # Keep as-is if already pass/fail/unknown
+
+    status = repaired.get("status", "fail")
+
+    # --- severity migration: 高/中/低 → P0/P1/P2 ---
+    sev = str(repaired.get("severity", "")).strip()
+    if sev in _SEVERITY_FROM_CHINESE:
+        repaired["severity"] = _SEVERITY_FROM_CHINESE[sev]
+    elif sev not in ("P0", "P1", "P2", ""):
+        repaired["severity"] = "P1"  # default to medium
+    if status != "pass" and not repaired.get("severity"):
+        repaired["severity"] = "P1"
+
+    # --- conclusion: derive from basis if missing ---
+    if not repaired.get("conclusion"):
+        basis = str(repaired.get("basis", "")).strip()
+        if basis:
+            repaired["conclusion"] = basis[:200]
+        else:
+            repaired["conclusion"] = f"发现{status}类问题"
+
+    # --- evidence_refs: construct from related_cells + snippet if missing ---
+    refs = repaired.get("evidence_refs")
+    constructed_from_fallback = False
+    if not isinstance(refs, list) or not refs:
+        constructed: List[dict] = []
+        related = repaired.get("related_cells") or repaired.get("cell") or ""
+        if isinstance(related, list):
+            cells = related
+        elif isinstance(related, str):
+            cells = [c.strip() for c in re.split(r"[,;，；\s]+", related) if c.strip()]
+        else:
+            cells = []
+        snippet_text = str(repaired.get("snippet", "") or repaired.get("basis", "")).strip()
+        for c in cells:
+            ref: dict = {"cell_or_range": c}
+            if snippet_text:
+                ref["excerpt"] = snippet_text[:_EXCERPT_MAX_LEN]
+            constructed.append(ref)
+        if not constructed and snippet_text:
+            constructed.append({"cell_or_range": "", "excerpt": snippet_text[:_EXCERPT_MAX_LEN]})
+        constructed_from_fallback = bool(constructed)
+        # Tag constructed excerpts so the auditor knows their origin
+        if constructed_from_fallback and constructed:
+            for ref in constructed:
+                if isinstance(ref, dict) and ref.get("cell_or_range"):
+                    ref["cell_or_range"] = str(ref.get("cell_or_range", "")) + _EXCERPT_CONSTRUCTED_MARKER
+        repaired["evidence_refs"] = constructed
+
+    # --- fail with empty evidence_refs ⇒ downgrade to unknown ---
+    if repaired.get("status") == "fail":
+        refs = repaired.get("evidence_refs") or []
+        if not isinstance(refs, list) or len(refs) == 0:
+            repaired["status"] = "unknown"
+            repaired["unknown_reason"] = "无法引用原始证据佐证该判定，降级为不确定"
+            repaired["severity"] = "P2"
+            status = "unknown"
+
+    # --- risk_type: default if missing ---
+    if status != "pass" and not repaired.get("risk_type"):
+        repaired["risk_type"] = "证据不足"
+
+    # --- unknown_reason: auto-generate if missing ---
+    if status == "unknown":
+        reason = str(repaired.get("unknown_reason", "")).strip()
+        if len(reason) < 10:
+            repaired["unknown_reason"] = "LLM未说明不确定原因：需要补充更多信息以判定"
+
+    # --- reasons: derive from basis if missing ---
+    if not repaired.get("reasons"):
+        basis = str(repaired.get("basis", "")).strip()
+        if basis:
+            repaired["reasons"] = [basis[:300]]
+        else:
+            repaired["reasons"] = [repaired.get("conclusion", "")]
+
+    # --- fix_suggestion: derive from suggestion if missing ---
+    if not repaired.get("fix_suggestion"):
+        sug = str(repaired.get("suggestion", "")).strip()
+        if sug:
+            repaired["fix_suggestion"] = {"supplement_explanation": sug[:300]}
+        else:
+            repaired["fix_suggestion"] = {}
+
+    return repaired
+
+
+def _validate_llm_results(
+    results_list: List[Any],
+    schema_records: Optional[List[dict]] = None,
+) -> Tuple[List[dict], bool]:
+    """Validate and repair a list of finding dicts.
+
+    Returns (valid_results, needs_retry).
+    If any result is unrepairable, needs_retry=True.
+    """
+    valid: List[dict] = []
+    needs_retry = False
+    for obj in results_list:
+        if not isinstance(obj, dict):
+            needs_retry = True
+            continue
+        ok, errors = _validate_finding_result(obj, schema_records)
+        if ok:
+            valid.append(obj)
+        else:
+            repaired = _repair_finding_result(obj, schema_records)
+            if repaired is not None:
+                ok2, _ = _validate_finding_result(repaired, schema_records)
+                if ok2:
+                    valid.append(repaired)
+                else:
+                    needs_retry = True
+            else:
+                needs_retry = True
+    return valid, needs_retry
+
+
+def _excerpt_matches(excerpt: str, actual_text: str) -> bool:
+    """Check if excerpt is a substring of actual_text after normalisation."""
+    _WS_RE = re.compile(r"\s+")
+    _PUNCT_RE = re.compile(r"[^\w一-鿿]+", re.UNICODE)
+    norm_ex = _PUNCT_RE.sub("", _WS_RE.sub("", excerpt)).lower()
+    norm_at = _PUNCT_RE.sub("", _WS_RE.sub("", actual_text)).lower()
+    if not norm_ex or not norm_at:
+        return False
+    return norm_ex in norm_at
+
+
+def _get_cell_text(ws, cell_ref: str) -> str:
+    """Safely get cell text from a worksheet.
+
+    Strips any _EXCERPT_CONSTRUCTED_MARKER suffix from cell_ref before lookup.
+    """
+    if not cell_ref or not ws:
+        return ""
+    # Strip constructed marker for cell lookup
+    clean_ref = cell_ref.replace(_EXCERPT_CONSTRUCTED_MARKER, "").strip()
+    if not clean_ref:
+        return ""
+    try:
+        cell = ws[clean_ref]
+        val = cell.value
+        return str(val).strip() if val is not None else ""
+    except Exception:
+        return ""
+
+
+def _verify_evidence_refs(evidence_refs: List[dict], ws) -> List[dict]:
+    """Verify evidence_refs excerpts match actual cell text; repair if possible.
+
+    Constructed refs (with _EXCERPT_CONSTRUCTED_MARKER suffix) are preserved as-is
+    since they were built from snippet/basis, not from real cell content.
+    """
+    if not ws:
+        return evidence_refs
+    verified: List[dict] = []
+    for ref in evidence_refs:
+        if not isinstance(ref, dict):
+            continue
+        cell = ref.get("cell_or_range", "")
+        excerpt = ref.get("excerpt", "")
+
+        # Constructed refs: keep as-is (can't verify against cell text)
+        if _EXCERPT_CONSTRUCTED_MARKER in str(cell):
+            verified.append(ref)
+            continue
+
+        actual_text = _get_cell_text(ws, cell)
+        if actual_text and _excerpt_matches(excerpt, actual_text):
+            verified.append(ref)
+        elif actual_text:
+            # 修复：替换为实际单元格文本
+            verified.append({**ref, "excerpt": actual_text[:_EXCERPT_MAX_LEN]})
+        # else: cell 无效或为空，丢弃该 evidence_ref
+    return verified
+
+
+# ---------------------------------------------------------------------------
+# Hallucination-reduction helpers
+# ---------------------------------------------------------------------------
+
+_EXCEPTION_FLAG_TOKENS = ("是", "有异常", "Y", "异常", "缺陷", "未通过")
+
+
+def _cross_validate_finding(finding: "Finding", wb) -> List[str]:
+    """Deterministic cross-checks against the workbook.
+
+    Returns a list of issue codes; empty list means no issues.
+    Issue codes:
+      - "exception_flag_contradicts_pass": status=pass but exception_flag cell is positive
+      - "coverage_claim_but_no_sample_size": risk_type=覆盖性 but sample_size empty
+      - "evidence_excerpt_mismatch": evidence_ref excerpt doesn't match cell
+      - "high_severity_no_evidence": severity=P0/fail but no evidence_refs
+    """
+    issues: List[str] = []
+    sheet = finding.sheet
+    cell_refs: List[str] = []
+    if finding.cell:
+        for c in str(finding.cell).split(","):
+            c = c.strip()
+            if c:
+                cell_refs.append(c)
+    try:
+        refs = json.loads(finding.evidence_refs) if finding.evidence_refs else []
+    except Exception:
+        refs = []
+    if isinstance(refs, list):
+        for r in refs:
+            if isinstance(r, dict) and r.get("cell_or_range"):
+                cell_refs.append(r["cell_or_range"])
+
+    if not wb or sheet not in wb.sheetnames:
+        return issues
+    ws = wb[sheet]
+
+    # 1) status=pass but exception_flag 单元格含异常标记
+    if finding.status == "pass":
+        for c in cell_refs:
+            txt = _get_cell_text(ws, c)
+            if txt and any(tok in txt for tok in _EXCEPTION_FLAG_TOKENS):
+                issues.append("exception_flag_contradicts_pass")
+                break
+
+    # 2) risk_type=覆盖性 但 sample_size 缺失
+    if finding.risk_type == "覆盖性":
+        # search schema records (sheet 已知情况下简单扫描) for sample_size
+        found_sample_size = False
+        for row in ws.iter_rows(values_only=False, min_row=1, max_row=min(80, ws.max_row or 80)):
+            for c in row:
+                if not c.value:
+                    continue
+                cv = str(c.value)
+                if any(k in cv for k in ("样本量", "样本数量", "测试期间样本")):
+                    # 找该行/列的非空值
+                    for r in range(c.row, min(c.row + 5, ws.max_row + 1)):
+                        for cc in range(c.column, min(c.column + 6, ws.max_column + 1)):
+                            v = ws.cell(row=r, column=cc).value
+                            if v is not None and str(v).strip() and str(v).strip() not in ("样本量", "样本数量", "测试期间样本"):
+                                found_sample_size = True
+                                break
+                        if found_sample_size:
+                            break
+                if found_sample_size:
+                    break
+            if found_sample_size:
+                break
+        if not found_sample_size:
+            issues.append("coverage_claim_but_no_sample_size")
+
+    # 3) evidence excerpt mismatch
+    for r in refs if isinstance(refs, list) else []:
+        if not isinstance(r, dict):
+            continue
+        cell = r.get("cell_or_range", "")
+        excerpt = r.get("excerpt", "")
+        if cell and excerpt:
+            actual = _get_cell_text(ws, cell)
+            if actual and not _excerpt_matches(excerpt, actual):
+                issues.append("evidence_excerpt_mismatch")
+                break
+
+    # 4) P0/fail with no evidence_refs
+    if finding.status == "fail" and finding.severity == "P0":
+        if not refs:
+            issues.append("high_severity_no_evidence")
+
+    return issues
+
+
+def _build_minimal_context(finding: "Finding", ws, max_chars: int = 2000) -> str:
+    """Build a minimal context (500-2000 chars) for an LLM re-review.
+
+    Includes:
+    - cells explicitly referenced in evidence_refs
+    - header row of the table region containing those cells
+    - 1 row above and 1 row below
+    """
+    if not ws:
+        return ""
+    parts: List[str] = []
+    # 解析 evidence_refs
+    try:
+        refs = json.loads(finding.evidence_refs) if finding.evidence_refs else []
+    except Exception:
+        refs = []
+    if not isinstance(refs, list):
+        refs = []
+    # 找到目标 cells
+    target_cells: List[str] = []
+    for r in refs[:6]:
+        if isinstance(r, dict) and r.get("cell_or_range"):
+            target_cells.append(r["cell_or_range"])
+    if not target_cells and finding.cell:
+        for c in str(finding.cell).split(","):
+            c = c.strip()
+            if c:
+                target_cells.append(c)
+    if not target_cells:
+        # fallback: 用 finding.snippet 中提及的 cell
+        if finding.snippet:
+            hits = re.findall(r"\b[A-Z]{1,3}\d{1,7}\b", finding.snippet)
+            target_cells.extend(hits[:3])
+
+    seen_rows: set = set()
+    seen_cells: set = set()
+    for cell in target_cells[:5]:
+        actual = _get_cell_text(ws, cell)
+        if actual and cell not in seen_cells:
+            parts.append(f"{cell}: {actual[:160]}")
+            seen_cells.add(cell)
+        m = re.match(r"^([A-Z]+)(\d+)$", cell)
+        if not m:
+            continue
+        col_letters, row_num = m.group(1), int(m.group(2))
+        # 表头（行 1-3）
+        for hdr_row in range(1, 4):
+            key = ("hdr", hdr_row)
+            if key in seen_rows:
+                continue
+            seen_rows.add(key)
+            for c in range(1, min(ws.max_column + 1, 12)):
+                v = ws.cell(row=hdr_row, column=c).value
+                if v:
+                    parts.append(f"{get_column_letter(c)}{hdr_row}: {str(v)[:80]}")
+        # 上下行
+        for r_off in (-1, 1):
+            r = row_num + r_off
+            if r < 1 or r > (ws.max_row or 0):
+                continue
+            key = ("row", r)
+            if key in seen_rows:
+                continue
+            seen_rows.add(key)
+            for c in range(1, min(ws.max_column + 1, 10)):
+                v = ws.cell(row=r, column=c).value
+                if v:
+                    parts.append(f"{get_column_letter(c)}{r}: {str(v)[:120]}")
+
+    text = "\n".join(parts)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "..."
+    return text
+
+
+def _challenge_finding_with_llm(
+    client,
+    model: str,
+    finding: "Finding",
+    minimal_context: str,
+) -> Optional[str]:
+    """Run a 'challenge' LLM call to verify a P0 or needs_review finding.
+
+    Returns "agree" / "disagree" / None on error.
+    """
+    if not client or not minimal_context:
+        return None
+    challenge_prompt = (
+        "你是一名严格的审计质量复核专家，正在以质疑者的角度审阅以下复核发现。\n"
+        "你的任务：判断该发现是否真实成立，或仅是表面/缺证据/逻辑不严。\n\n"
+        f"【finding JSON】\n{finding.basis[:1000]}\n\n"
+        f"【相关最小上下文（底稿原文片段）】\n{minimal_context[:1500]}\n\n"
+        "请回答：agree（成立）/disagree（不成立/无依据）。只输出一个词。"
+    )
+    try:
+        answer = _llm_chat(
+            client=client,
+            model=model,
+            messages=[
+                {"role": "system", "content": "你是审计复核的质疑者。"},
+                {"role": "user", "content": challenge_prompt},
+            ],
+            stage="challenge",
+            max_attempts=2,
+            temperature=0.1,
+            max_tokens=64,
+        )
+        answer = (answer or "").strip().lower()
+        if "disagree" in answer or "不同意" in answer or "不成立" in answer:
+            return "disagree"
+        if "agree" in answer or "同意" in answer or "成立" in answer:
+            return "agree"
+        return None
+    except Exception:
+        return None
 
 
 def resolve_llm_config() -> Tuple[Optional[str], Optional[str], str]:
@@ -298,24 +816,45 @@ def _llm_request_json_list(
     user_prompt: str,
     stage: str,
     max_attempts: int = 3,
+    result_schema: Optional[Dict[str, Any]] = None,
+    schema_records: Optional[List[dict]] = None,
 ) -> Tuple[Optional[List[object]], Optional[str]]:
     """Unified entry for LLM calls that return JSON list responses ({results: [...]}).
 
     Transport errors (rate limit, timeout, server errors) are handled internally
     by _llm_chat with proper differentiated backoff. This outer loop only retries
-    on JSON parse failures (LLM returned valid text but not the expected format).
+    on JSON parse failures or schema validation failures.
+
+    If ``result_schema`` is provided, each item in the returned list is validated
+    against it (and repaired if possible).  If any item cannot be repaired, the
+    user prompt is amended with the validation error and a retry is triggered.
     """
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     last_error: Optional[str] = None
+    last_validation_errors: List[str] = []
     for attempt in range(1, max(1, int(max_attempts)) + 1):
         try:
+            # If we have prior validation errors, augment the user prompt for retry
+            current_messages = messages
+            if last_validation_errors and attempt > 1:
+                err_text = "；".join(last_validation_errors[:3])
+                retry_note = (
+                    f"\n\n[Retry hint] 上一次输出未通过结构化校验，问题：{err_text}。"
+                    f"请严格按 system 字段定义重新输出，"
+                    f"确保 status=pass/fail/unknown、severity=P0/P1/P2、"
+                    f"fail 时 evidence_refs 必填且 excerpt 逐字来自原文。"
+                )
+                current_messages = [
+                    messages[0],
+                    {"role": "user", "content": user_prompt + retry_note},
+                ]
             content = _llm_chat(
                 client=client,
                 model=model,
-                messages=messages,
+                messages=current_messages,
                 stage=stage,
                 max_attempts=3,
                 temperature=0.1,
@@ -326,10 +865,29 @@ def _llm_request_json_list(
                 parsed = parsed.get("results") or parsed.get("data") or parsed.get("items")
             if not isinstance(parsed, list):
                 raise RuntimeError("LLM返回非JSON results 数组")
+            # 验证（如果提供 schema）
+            if result_schema is not None:
+                valid_items, needs_retry = _validate_llm_results(parsed, schema_records)
+                if needs_retry:
+                    # 收集错误以供 retry
+                    last_validation_errors = []
+                    for obj in parsed:
+                        if isinstance(obj, dict):
+                            ok, errs = _validate_finding_result(obj, schema_records)
+                            if not ok:
+                                last_validation_errors.extend(errs)
+                    if not last_validation_errors:
+                        last_validation_errors = ["部分结果无法通过结构化校验"]
+                    if attempt < max_attempts:
+                        _llm_stat(stage, "error_schema", 1)
+                        time.sleep(min(8.0, 1.5 * attempt))
+                        continue
+                    # 达到 max_attempts 仍有问题，使用修复后的结果
+                    parsed = valid_items
             return parsed, None
         except Exception as e:
             last_error = str(e)
-            # Only retry JSON parse failures; transport errors already exhausted in _llm_chat
+            # Only retry JSON parse / schema failures; transport errors already exhausted
             is_parse_error = "json" in str(e).lower() or "parse" in str(e).lower() or "非JSON" in str(e)
             if is_parse_error and attempt < max_attempts:
                 _llm_stat(stage, "error_parse", 1)
@@ -741,12 +1299,15 @@ def _llm_check_sheet_by_checkpoints(
         return [
             Finding(
                 issue_type="LLM判定：检查要点无法复核（Sheet无文本）",
-                severity="中",
+                severity="P1",
                 sheet=ws_title,
                 cell=None,
                 snippet="",
                 basis="Sheet内未提取到可用于复核的文本单元格。",
                 suggestion="确认该Sheet是否为图片/对象或空白；如为图片型底稿需先OCR或改用可读文本版本。",
+                status="unknown",
+                unknown_reason="Sheet内无文本可复核",
+                risk_type="证据不足",
             )
         ]
 
@@ -758,19 +1319,28 @@ def _llm_check_sheet_by_checkpoints(
         "3) （可选）该Sheet所引用的附件预览清单（附件路径/描述/状态）。\n\n"
         "你的任务：逐条检查要点，判断该Sheet是否存在相关问题（未覆盖/证据不足/表述不清/范围不全/仅访谈等）。\n"
         "重要判断规则（避免误报）：\n"
-        "1) 如果Sheet内容明确写明“未执行/未开展/未进行/不存在/未对…审阅/未清查”，则这本身意味着控制未执行或存在缺陷。此时不要将“缺少过程证据”作为独立问题点重复输出；应将问题表述为“控制未执行/未开展（无清查过程证据属结果）”。\n"
+        "1) 如果Sheet内容明确写明“未执行/未开展/未进行/不存在/未对...审阅/未清查”，则这本身意味着控制未执行或存在缺陷。此时不要将“缺少过程证据”作为独立问题点重复输出；应将问题表述为“控制未执行/未开展（无清查过程证据属结果）”。\n"
         "2) 仅当Sheet声称已执行（如“已审阅/已清查/已复核/已下发确认/已收集反馈”），但未提供相应过程证据时，才输出“缺少过程证据/证据不足”。\n"
         "输出要求：必须输出严格JSON对象：{\"results\": [...]}。\n"
         "results每个元素必须包含字段：\n"
         "- id: 整数\n"
         "- checkpoint: 字符串（原检查要点）\n"
-        "- status: \"无问题\"/\"有问题\"/\"不确定\"\n"
-        "- severity: \"高\"/\"中\"/\"低\"（当status=无问题时可填\"\"）\n"
-        "- issue_type: 字符串（当status=无问题时可填\"\"）\n"
-        "- basis: 字符串（简要说明为什么判断有问题/不确定，需引用Sheet内容中的关键句或单元格坐标）\n"
-        "- suggestion: 字符串（可执行整改建议，含证据类型/范围/抽样基准等）\n"
-        "- related_cells: 字符串数组（尽量给出相关单元格坐标，如\"C15\"；没有则[]）\n"
-        "- missing_evidence: 字符串数组（缺失证据类型，如截图/导出清单/日志/台账/审批/协议等；没有则[]）\n"
+        "- status: \"pass\"/\"fail\"/\"unknown\" (无问题/有问题/不确定)\n"
+        "- conclusion: 一句话结论（当status=pass时也建议给出一句话）\n"
+        "- reasons: 字符串数组，2-5条要点（说明判断依据）\n"
+        "- evidence_refs: 数组，每个元素含 {sheet, cell_or_range, attachment(可选), excerpt(原文摘录)}。excerpt必须逐字来自sheet_text对应单元格内容。\n"
+        "  * status=fail时必须至少1个evidence_ref；无法引用原文时status必须为unknown\n"
+        "  * excerpt不可编造，必须是sheet_text中能找到的原句片段\n"
+        "- severity: \"P0\"/\"P1\"/\"P2\"（当status!=pass时必填）\n"
+        "- risk_type: \"覆盖性\"/\"一致性\"/\"证据不足\"/\"方法性\"/\"逻辑性\"/\"跨字段一致性\"之一\n"
+        "- fix_suggestion: 对象，含 {missing_field, supplement_explanation, required_evidence_type}，说明缺什么/补什么/要哪类证据\n"
+        "- unknown_reason: 当status=unknown时必填，≥10字符，说明缺少什么信息\n"
+        "向后兼容字段（可同时输出，但以新字段为准）：\n"
+        "- basis: 字符串（可执行整改建议，保留旧版兼容）\n"
+        "- suggestion: 字符串（保留旧版兼容）\n"
+        "- issue_type: 字符串（保留旧版兼容）\n"
+        "- related_cells: 字符串数组（保留旧版兼容，转换到evidence_refs）\n"
+        "- missing_evidence: 字符串数组（保留旧版兼容，转换到fix_suggestion.required_evidence_type）\n"
         "不要输出Markdown代码块，不要输出多余文字。"
     )
 
@@ -793,18 +1363,39 @@ def _llm_check_sheet_by_checkpoints(
             for obj in objs:
                 if not isinstance(obj, dict):
                     continue
-                status = str(obj.get("status", "")).strip()
-                if status == "无问题":
+                # --- status 迁移: 中文 → 英文 ---
+                raw_status = str(obj.get("status", "")).strip()
+                if raw_status == "无问题":
+                    status = "pass"
+                elif raw_status == "有问题":
+                    status = "fail"
+                elif raw_status == "不确定":
+                    status = "unknown"
+                else:
+                    status = raw_status  # 已经是 pass/fail/unknown
+                if status == "pass":
                     continue
                 checkpoint = str(obj.get("checkpoint", "")).strip()
-                severity = str(obj.get("severity", "")).strip() or ("中" if status == "不确定" else "中")
+                # --- severity 迁移: 中文 → P0/P1/P2 ---
+                raw_sev = str(obj.get("severity", "")).strip()
+                severity = _SEVERITY_FROM_CHINESE.get(raw_sev, raw_sev)
+                if severity not in ("P0", "P1", "P2"):
+                    severity = "P1" if status != "unknown" else "P2"
                 issue_type = str(obj.get("issue_type", "")).strip() or (
-                    "检查要点存在问题" if status == "有问题" else "检查要点信息不足/不确定"
+                    "检查要点存在问题“ if status == ”fail“ else ”检查要点信息不足/不确定"
                 )
                 basis = str(obj.get("basis", "")).strip()
                 suggestion = str(obj.get("suggestion", "")).strip()
+                conclusion = str(obj.get("conclusion", "")).strip()
+                reasons_raw = obj.get("reasons", [])
+                reasons_list = [str(r).strip() for r in reasons_raw if r] if isinstance(reasons_raw, list) else []
+                risk_type = str(obj.get("risk_type", "")).strip()
+                unknown_reason = str(obj.get("unknown_reason", "")).strip()
+                fix_suggestion_obj = obj.get("fix_suggestion") or {}
+                if not isinstance(fix_suggestion_obj, dict):
+                    fix_suggestion_obj = {}
                 sheet_indicates_not_done = False
-                sheet_signal_text = (basis or "") + "\n" + (sheet_text or "")
+                sheet_signal_text = (basis or "") + "\n" + (conclusion or "") + "\n" + (sheet_text or "")
                 if any(k in sheet_signal_text for k in ("未对", "未进行", "未开展", "未执行", "不存在", "未审阅", "未清查", "未复核")):
                     if any(k in checkpoint for k in ("清查全过程", "过程证据", "留痕", "反馈", "下发", "收集")) or any(
                         k in issue_type for k in ("证据", "缺失", "不足", "留痕", "反馈", "全过程")
@@ -843,17 +1434,76 @@ def _llm_check_sheet_by_checkpoints(
                         if len(picked_cells) >= 6:
                             break
                 cell = ",".join(picked_cells) if picked_cells else None
+
+                # --- 收集 evidence_refs：优先新字段，回退 related_cells + 实际单元格文本 ---
+                evidence_refs_list: List[dict] = []
+                raw_refs = obj.get("evidence_refs")
+                if isinstance(raw_refs, list) and raw_refs:
+                    for ref in raw_refs:
+                        if not isinstance(ref, dict):
+                            continue
+                        ev_cell = str(ref.get("cell_or_range", "")).strip()
+                        ev_sheet = str(ref.get("sheet", "")).strip() or ws_title
+                        ev_attachment = str(ref.get("attachment", "")).strip()
+                        ev_excerpt = str(ref.get("excerpt", "")).strip()
+                        if ev_cell:
+                            evidence_refs_list.append({
+                                "sheet": ev_sheet,
+                                "cell_or_range": ev_cell,
+                                "attachment": ev_attachment,
+                                "excerpt": ev_excerpt,
+                            })
+                # 验证 excerpt 与实际单元格文本的匹配
+                evidence_refs_list = _verify_evidence_refs(evidence_refs_list, ws)
+                # 旧字段回退：把 picked_cells + snippet 组成 evidence_refs
+                if not evidence_refs_list and picked_cells:
+                    for cc in picked_cells:
+                        ctext = _get_cell_value(ws, cc) or ""
+                        if ctext:
+                            evidence_refs_list.append({
+                                "sheet": ws_title,
+                                "cell_or_range": cc,
+                                "excerpt": ctext[:_EXCERPT_MAX_LEN],
+                            })
+
+                # --- fail 必须有 evidence_refs，否则降级为 unknown ---
+                if status == "fail" and not evidence_refs_list:
+                    status = "unknown"
+                    unknown_reason = unknown_reason or "无法引用原始证据佐证该判定，降级为不确定"
+                    severity = "P2"
+
                 missing_evidence = obj.get("missing_evidence", [])
                 missing_text = ""
                 if isinstance(missing_evidence, list) and missing_evidence:
                     missing_text = "缺失证据: " + "、".join(str(x).strip() for x in missing_evidence if str(x).strip())
+                # 补全 fix_suggestion
+                if not fix_suggestion_obj.get("required_evidence_type") and missing_evidence:
+                    if isinstance(missing_evidence, list) and missing_evidence:
+                        fix_suggestion_obj["required_evidence_type"] = "、".join(str(x).strip() for x in missing_evidence if str(x).strip())[:300]
+                if not fix_suggestion_obj.get("supplement_explanation") and suggestion:
+                    fix_suggestion_obj["supplement_explanation"] = suggestion[:300]
+
+                # --- 构造分层结论：conclusion + reasons ---
                 basis_parts: List[str] = []
                 if checkpoint:
                     basis_parts.append("检查要点: " + checkpoint)
+                if conclusion:
+                    basis_parts.append("结论: " + conclusion)
+                if reasons_list:
+                    basis_parts.append("理由: " + " | ".join(reasons_list[:5]))
                 if basis:
                     basis_parts.append("依据: " + basis)
                 if missing_text:
                     basis_parts.append(missing_text)
+                if evidence_refs_list:
+                    refs_text = "; ".join(
+                        f"{r.get('cell_or_range', '')}: {r.get('excerpt', '')[:200]}"
+                        for r in evidence_refs_list[:3] if r.get('excerpt')
+                    )
+                    if refs_text:
+                        basis_parts.append("引用: " + refs_text)
+                if unknown_reason:
+                    basis_parts.append("不确定原因: " + unknown_reason)
                 basis2 = "\n".join(p for p in basis_parts if p).strip()
 
                 snippet = ""
@@ -866,6 +1516,15 @@ def _llm_check_sheet_by_checkpoints(
                         parts.append(f"{cc}: {_truncate(cell_text, 60)}")
                     if parts:
                         snippet = _truncate(" | ".join(parts), 220)
+                if not snippet and evidence_refs_list:
+                    parts: List[str] = []
+                    for ref in evidence_refs_list[:3]:
+                        ex = ref.get("excerpt", "")
+                        cc = ref.get("cell_or_range", "")
+                        if ex:
+                            parts.append(f"{cc}: {_truncate(ex, 60)}")
+                    if parts:
+                        snippet = _truncate(" | ".join(parts), 220)
                 if not snippet and basis2:
                     snippet = _truncate(basis2.replace("\n", " "), 220)
 
@@ -873,8 +1532,8 @@ def _llm_check_sheet_by_checkpoints(
                     k in (issue_type or "") for k in ("证据不足", "缺失", "全过程", "留痕")
                 ):
                     issue_type = "检查要点-控制未执行/未开展（因此无过程证据）"
-                    if severity not in {"高", "中"}:
-                        severity = "中"
+                    if severity not in ("P0", "P1"):
+                        severity = "P1"
                     if not suggestion:
                         suggestion = (
                             "明确该控制在审计期间未执行的事实与影响；作为缺陷记录并提出整改：建立权限清查机制（导出清单-下发确认-收集反馈-例外处置-复核留痕），并补充后续期间执行记录。"
@@ -883,15 +1542,22 @@ def _llm_check_sheet_by_checkpoints(
                 findings.append(
                     Finding(
                         issue_type="LLM判定：" + issue_type,
-                        severity=severity if severity in {"高", "中", "低"} else "中",
+                        severity=severity,
                         sheet=ws_title,
                         cell=cell,
                         snippet=snippet,
-                        basis=_truncate(basis2 or "LLM判定存在问题/不确定", 1200),
+                        basis=_truncate(basis2 or "LLM判定存在问题/不确定", 3000),
                         suggestion=_truncate(
                             suggestion or "对照检查要点补充执行步骤与证据，并在底稿中保留可复核来源。",
                             1200,
                         ),
+                        status=status,
+                        risk_type=risk_type or ("证据不足" if status == "fail" else ""),
+                        evidence_refs=json.dumps(evidence_refs_list, ensure_ascii=False),
+                        conclusion=conclusion,
+                        reasons=json.dumps(reasons_list, ensure_ascii=False),
+                        fix_suggestion_detail=json.dumps(fix_suggestion_obj, ensure_ascii=False),
+                        unknown_reason=unknown_reason,
                     )
                 )
 
@@ -931,24 +1597,30 @@ def _llm_check_sheet_by_checkpoints(
                         findings.append(
                             Finding(
                                 issue_type="LLM判定：检查要点复核失败",
-                                severity="中",
+                                severity="P1",
                                 sheet=ws_title,
                                 cell=None,
                                 snippet="",
                                 basis=_truncate(f"检查要点: {cp}\nLLM调用失败: {err1}", 1200),
                                 suggestion="检查LLM接口配置（.env）、网络连通性；必要时减少检查要点条数或缩短Sheet文本后重试。",
+                                status="unknown",
+                                unknown_reason="LLM调用失败，无法复核",
+                                risk_type="证据不足",
                             )
                         )
             else:
                 findings.append(
                     Finding(
                         issue_type="LLM判定：检查要点复核失败",
-                        severity="中",
+                        severity="P1",
                         sheet=ws_title,
                         cell=None,
                         snippet="",
                         basis=_truncate("检查要点: " + "；".join(chunk) + f"\nLLM调用失败: {last_error}", 1200),
                         suggestion="检查LLM接口配置（.env）、网络连通性；必要时减少检查要点条数或缩短Sheet文本后重试。",
+                        status="unknown",
+                        unknown_reason="LLM调用失败，无法复核",
+                        risk_type="证据不足",
                     )
                 )
 
@@ -979,7 +1651,7 @@ def _check_attachment_references(ws_title: str, ws, attachments_preview: Dict[st
             findings.append(
                 Finding(
                     issue_type="附件证据引用未匹配到预览清单",
-                    severity="低",
+                    severity="P2",
                     sheet=ws_title,
                     cell=coord,
                     snippet=_truncate(text, 220),
@@ -997,7 +1669,7 @@ def _check_attachment_references(ws_title: str, ws, attachments_preview: Dict[st
             findings.append(
                 Finding(
                     issue_type="附件预览状态异常",
-                    severity="中",
+                    severity="P1",
                     sheet=ws_title,
                     cell=coord,
                     snippet=_truncate(text, 220),
@@ -1068,7 +1740,7 @@ def _llm_check_evidence_vs_steps(
                 findings.append(
                     Finding(
                         issue_type="附件证据编号/文件未匹配（可能引用错误）",
-                        severity="中",
+                        severity="P1",
                         sheet=ws_title,
                         cell=c_cell,
                         snippet=_truncate(c_text, 220),
@@ -1145,7 +1817,7 @@ def _llm_check_evidence_vs_steps(
         findings.append(
             Finding(
                 issue_type="证据-步骤一致性抽样复核（为控制LLM调用规模）",
-                severity="低",
+                severity="P2",
                 sheet=ws_title,
                 cell=None,
                 snippet="",
@@ -1165,12 +1837,16 @@ def _llm_check_evidence_vs_steps(
         "输出要求：必须输出严格JSON对象：{\"results\": [...]}。\n"
         "results中每个元素对应输入id，且必须包含字段：\n"
         "- id: 整数\n"
-        "- status: \"无问题\"/\"有问题\"/\"不确定\"\n"
-        "- severity: \"高\"/\"中\"/\"低\"（当status=无问题时可填\"\"）\n"
-        "- issue_type: 字符串（当status=无问题时可填\"\"）\n"
-        "- basis: 字符串（结合标准/执行/证据描述说明判断理由）\n"
-        "- suggestion: 字符串（给出可执行整改建议：补充何种证据、如何说明证据与结论对应、抽样基准/范围等）\n"
-        "- missing_evidence: 字符串数组（缺失证据类型；没有则[]）\n"
+        "- status: \"pass\"/\"fail\"/\"unknown\" (无问题/有问题/不确定)\n"
+        "- conclusion: 一句话结论\n"
+        "- reasons: 字符串数组，2-5条要点\n"
+        "- evidence_refs: 数组，每个元素含 {sheet, cell_or_range, attachment(可选), excerpt(原文摘录)}。excerpt必须逐字来自执行/标准/附件描述。\n"
+        "  * status=fail时必须至少1个evidence_ref；无法引用时status必须为unknown\n"
+        "- severity: \"P0\"/\"P1\"/\"P2\"（当status!=pass时必填）\n"
+        "- risk_type: \"覆盖性\"/\"一致性\"/\"证据不足\"/\"方法性\"/\"逻辑性\"/\"跨字段一致性\"之一\n"
+        "- fix_suggestion: 对象，含 {missing_field, supplement_explanation, required_evidence_type}\n"
+        "- unknown_reason: 当status=unknown时必填，≥10字符\n"
+        "向后兼容字段（可同时输出）：basis, suggestion, issue_type, missing_evidence\n"
         "不要输出Markdown代码块，不要输出多余文字。"
     )
 
@@ -1193,8 +1869,16 @@ def _llm_check_evidence_vs_steps(
                         rid = int(str(rid).strip())
                     except Exception:
                         continue
-                status = str(obj.get("status", "")).strip()
-                if status == "无问题":
+                raw_status = str(obj.get("status", "")).strip()
+                if raw_status == "无问题":
+                    status = "pass"
+                elif raw_status == "有问题":
+                    status = "fail"
+                elif raw_status == "不确定":
+                    status = "unknown"
+                else:
+                    status = raw_status
+                if status == "pass":
                     continue
                 case = id_to_case.get(int(rid))
                 if not case:
@@ -1202,38 +1886,109 @@ def _llm_check_evidence_vs_steps(
                 c_cell = str(case.get("execution_cell") or "").strip() or None
                 c_text = str(case.get("execution_text") or "")
                 a_text = str(case.get("standard_text") or "")
-                severity = str(obj.get("severity", "")).strip() or ("中" if status == "不确定" else "中")
+                raw_sev = str(obj.get("severity", "")).strip()
+                severity = _SEVERITY_FROM_CHINESE.get(raw_sev, raw_sev)
+                if severity not in ("P0", "P1", "P2"):
+                    severity = "P1" if status != "unknown" else "P2"
                 issue_type = str(obj.get("issue_type", "")).strip() or (
-                    "证据与审计步骤不匹配" if status == "有问题" else "证据与审计步骤信息不足/不确定"
+                    "证据与审计步骤不匹配“ if status == ”fail“ else ”证据与审计步骤信息不足/不确定"
                 )
                 basis = str(obj.get("basis", "")).strip()
                 suggestion = str(obj.get("suggestion", "")).strip()
+                conclusion = str(obj.get("conclusion", "")).strip()
+                reasons_raw = obj.get("reasons", [])
+                reasons_list = [str(r).strip() for r in reasons_raw if r] if isinstance(reasons_raw, list) else []
+                risk_type = str(obj.get("risk_type", "")).strip()
+                unknown_reason = str(obj.get("unknown_reason", "")).strip()
+                fix_suggestion_obj = obj.get("fix_suggestion") or {}
+                if not isinstance(fix_suggestion_obj, dict):
+                    fix_suggestion_obj = {}
                 missing_evidence = obj.get("missing_evidence", [])
                 missing_text = ""
                 if isinstance(missing_evidence, list) and missing_evidence:
                     missing_text = "缺失证据: " + "、".join(str(x).strip() for x in missing_evidence if str(x).strip())
+
+                # 收集 evidence_refs
+                evidence_refs_list: List[dict] = []
+                raw_refs = obj.get("evidence_refs")
+                if isinstance(raw_refs, list) and raw_refs:
+                    for ref in raw_refs:
+                        if not isinstance(ref, dict):
+                            continue
+                        ev_cell = str(ref.get("cell_or_range", "")).strip()
+                        ev_sheet = str(ref.get("sheet", "")).strip() or ws_title
+                        ev_attachment = str(ref.get("attachment", "")).strip()
+                        ev_excerpt = str(ref.get("excerpt", "")).strip()
+                        if ev_cell or ev_excerpt:
+                            evidence_refs_list.append({
+                                "sheet": ev_sheet,
+                                "cell_or_range": ev_cell,
+                                "attachment": ev_attachment,
+                                "excerpt": ev_excerpt,
+                            })
+                # 旧字段回退
+                if not evidence_refs_list and c_cell:
+                    evidence_refs_list.append({
+                        "sheet": ws_title,
+                        "cell_or_range": c_cell,
+                        "excerpt": c_text[:_EXCERPT_MAX_LEN] if c_text else "",
+                    })
+                # 验证
+                evidence_refs_list = _verify_evidence_refs(evidence_refs_list, ws)
+                # fail 必须有 evidence_refs
+                if status == "fail" and not evidence_refs_list:
+                    status = "unknown"
+                    unknown_reason = unknown_reason or "无法引用原始证据佐证该判定，降级为不确定"
+                    severity = "P2"
+
+                if not fix_suggestion_obj.get("required_evidence_type") and missing_evidence:
+                    if isinstance(missing_evidence, list) and missing_evidence:
+                        fix_suggestion_obj["required_evidence_type"] = "、".join(str(x).strip() for x in missing_evidence if str(x).strip())[:300]
+                if not fix_suggestion_obj.get("supplement_explanation") and suggestion:
+                    fix_suggestion_obj["supplement_explanation"] = suggestion[:300]
+
                 basis_parts: List[str] = []
                 if a_text:
                     basis_parts.append("标准程序: " + _truncate(a_text, 260))
+                if conclusion:
+                    basis_parts.append("结论: " + conclusion)
+                if reasons_list:
+                    basis_parts.append("理由: " + " | ".join(reasons_list[:5]))
                 if basis:
                     basis_parts.append("LLM依据: " + basis)
                 if missing_text:
                     basis_parts.append(missing_text)
+                if evidence_refs_list:
+                    refs_text = "; ".join(
+                        f"{r.get('cell_or_range', '')}: {r.get('excerpt', '')[:200]}"
+                        for r in evidence_refs_list[:3] if r.get('excerpt')
+                    )
+                    if refs_text:
+                        basis_parts.append("引用: " + refs_text)
+                if unknown_reason:
+                    basis_parts.append("不确定原因: " + unknown_reason)
                 final_basis = "\n".join(p for p in basis_parts if p).strip()
 
                 findings.append(
                     Finding(
                         issue_type="LLM判定：证据-步骤一致性-" + issue_type,
-                        severity=severity if severity in {"高", "中", "低"} else "中",
+                        severity=severity,
                         sheet=ws_title,
                         cell=c_cell,
                         snippet=_truncate(c_text, 220),
-                        basis=_truncate(final_basis or "LLM判定存在问题/不确定", 1200),
+                        basis=_truncate(final_basis or "LLM判定存在问题/不确定", 3000),
                         suggestion=_truncate(
                             suggestion
-                            or "补充与该审计步骤直接对应的截图/导出清单/日志/审批等证据，并在底稿中写明“证据→核查点→结论”的对应关系。",
+                            or "补充与该审计步骤直接对应的截图/导出清单/日志/审批等证据，并在底稿中写明「证据→核查点→结论」的对应关系。",
                             1200,
                         ),
+                        status=status,
+                        risk_type=risk_type or ("证据不足" if status == "fail" else ""),
+                        evidence_refs=json.dumps(evidence_refs_list, ensure_ascii=False),
+                        conclusion=conclusion,
+                        reasons=json.dumps(reasons_list, ensure_ascii=False),
+                        fix_suggestion_detail=json.dumps(fix_suggestion_obj, ensure_ascii=False),
+                        unknown_reason=unknown_reason,
                     )
                 )
 
@@ -1268,7 +2023,7 @@ def _llm_check_evidence_vs_steps(
                         findings.append(
                             Finding(
                                 issue_type="LLM判定：证据-步骤一致性复核失败",
-                                severity="中",
+                                severity="P1",
                                 sheet=ws_title,
                                 cell=None,
                                 snippet="",
@@ -1280,7 +2035,7 @@ def _llm_check_evidence_vs_steps(
                 findings.append(
                     Finding(
                         issue_type="LLM判定：证据-步骤一致性复核失败",
-                        severity="中",
+                        severity="P1",
                         sheet=ws_title,
                         cell=None,
                         snippet="",
@@ -1370,11 +2125,11 @@ def _check_procedure_pairs(ws_title: str, ws) -> List[Finding]:
                     findings.append(
                         Finding(
                             issue_type="执行列疑似未替换模板/未按要求填列",
-                            severity="高",
+                            severity="P0",
                             sheet=ws_title,
                             cell=c_cell,
                             snippet=_truncate(c_text, 220),
-                            basis="执行列内容更像标准模板/判定口径（如“如果/以下/被认为”及大量条款），缺少“我们获取/检查/抽样/复核”等实际执行描述。",
+                            basis="执行列内容更像标准模板/判定口径（如「如果/以下/被认为」及大量条款），缺少「我们获取/检查/抽样/复核」等实际执行描述。",
                             suggestion="将该单元格补充为实际执行步骤与获取证据描述（含样本框定方法、样本来源/编号、证据链接/截图/导出）。",
                         )
                     )
@@ -1384,7 +2139,7 @@ def _check_procedure_pairs(ws_title: str, ws) -> List[Finding]:
                 findings.append(
                     Finding(
                         issue_type="程序执行不到位/仅依赖访谈",
-                        severity="中",
+                        severity="P1",
                         sheet=ws_title,
                         cell=c_cell,
                         snippet=_truncate(c_text, 220),
@@ -1397,7 +2152,7 @@ def _check_procedure_pairs(ws_title: str, ws) -> List[Finding]:
                 findings.append(
                     Finding(
                         issue_type="证据类型缺失",
-                        severity="中",
+                        severity="P1",
                         sheet=ws_title,
                         cell=c_cell,
                         snippet=_truncate(c_text, 220),
@@ -1411,7 +2166,7 @@ def _check_procedure_pairs(ws_title: str, ws) -> List[Finding]:
                     findings.append(
                         Finding(
                             issue_type="账号新增样本总量基准可能有误",
-                            severity="中",
+                            severity="P1",
                             sheet=ws_title,
                             cell=c_cell,
                             snippet=_truncate(c_text, 220),
@@ -1425,7 +2180,7 @@ def _check_procedure_pairs(ws_title: str, ws) -> List[Finding]:
                     findings.append(
                         Finding(
                             issue_type="离职账号禁用检查方法可能有误",
-                            severity="中",
+                            severity="P1",
                             sheet=ws_title,
                             cell=c_cell,
                             snippet=_truncate(c_text, 220),
@@ -1439,7 +2194,7 @@ def _check_procedure_pairs(ws_title: str, ws) -> List[Finding]:
                     findings.append(
                         Finding(
                             issue_type="未覆盖调岗权限变更/禁用测试",
-                            severity="中",
+                            severity="P1",
                             sheet=ws_title,
                             cell=c_cell,
                             snippet=_truncate(c_text, 220),
@@ -1454,7 +2209,7 @@ def _check_procedure_pairs(ws_title: str, ws) -> List[Finding]:
                         findings.append(
                             Finding(
                                 issue_type="设计有效性证据不足（密码策略）",
-                                severity="低",
+                                severity="P2",
                                 sheet=ws_title,
                                 cell=c_cell,
                                 snippet=_truncate(c_text, 220),
@@ -1466,7 +2221,7 @@ def _check_procedure_pairs(ws_title: str, ws) -> List[Finding]:
                     findings.append(
                         Finding(
                             issue_type="密码策略证据有效性不足",
-                            severity="中",
+                            severity="P1",
                             sheet=ws_title,
                             cell=c_cell,
                             snippet=_truncate(c_text, 220),
@@ -1480,7 +2235,7 @@ def _check_procedure_pairs(ws_title: str, ws) -> List[Finding]:
                     findings.append(
                         Finding(
                             issue_type="批处理作业证据不足/范围可能未覆盖",
-                            severity="中",
+                            severity="P1",
                             sheet=ws_title,
                             cell=c_cell,
                             snippet=_truncate(c_text, 220),
@@ -1494,7 +2249,7 @@ def _check_procedure_pairs(ws_title: str, ws) -> List[Finding]:
                     findings.append(
                         Finding(
                             issue_type="系统变更证据不足/样本框定可能有误",
-                            severity="中",
+                            severity="P1",
                             sheet=ws_title,
                             cell=c_cell,
                             snippet=_truncate(c_text, 220),
@@ -1515,7 +2270,7 @@ def _check_sheet_scope(ws_title: str, ws) -> List[Finding]:
             findings.append(
                 Finding(
                     issue_type="特权账号识别范围可能不完整",
-                    severity="中",
+                    severity="P1",
                     sheet=ws_title,
                     cell=None,
                     snippet=_truncate(sheet_text, 220),
@@ -1529,7 +2284,7 @@ def _check_sheet_scope(ws_title: str, ws) -> List[Finding]:
             findings.append(
                 Finding(
                     issue_type="供应商托管场景证据可能不足",
-                    severity="中",
+                    severity="P1",
                     sheet=ws_title,
                     cell=None,
                     snippet=_truncate(sheet_text, 220),
@@ -1626,12 +2381,12 @@ def _ensure_openai_client(api_key: str, base_url: Optional[str]):
         or os.getenv("API_TIMEOUT")
         or ""
     )
-    timeout_s = 60.0
+    timeout_s = 180.0
     if str(timeout_raw).strip():
         try:
             timeout_s = float(str(timeout_raw).strip())
         except Exception:
-            timeout_s = 60.0
+            timeout_s = 180.0
 
     kwargs = {"api_key": api_key, "timeout": timeout_s, "max_retries": 0}
     if base_url:
@@ -1713,9 +2468,22 @@ def _llm_review_findings(
         "1) 不要泛泛而谈，要结合该条的摘录/上下文给出具体可执行建议（证据类型、样本总体/抽样基准、覆盖范围、职责分离、日志/台账/审批/协议等）。\n"
         "2) 如果你认为该条可能误报/信息不足，要明确说明需要补充哪些信息才能判断。\n"
         "3) 输出必须为严格JSON对象，格式为 {\"results\": [...]}。\n"
-        "4) results 内每个元素对应输入的id，且必须包含字段：id, llm_validity(成立/不成立/不确定), llm_severity(高/中/低), llm_comment, llm_missing_evidence, llm_next_actions。\n"
-        "5) llm_missing_evidence 与 llm_next_actions 均为字符串数组。\n"
-        "6) 不要输出Markdown代码块，不要输出多余解释文字。\n"
+        "4) results 内每个元素对应输入的id，且必须包含字段：\n"
+        "   - id: 整数\n"
+        "   - status: \"pass\"/\"fail\"/\"unknown\"\n"
+        "   - llm_validity: 成立/不成立/不确定（向后兼容）\n"
+        "   - llm_severity: 高/中/低（向后兼容）\n"
+        "   - severity: P0/P1/P2（结构化）\n"
+        "   - conclusion: 一句话结论\n"
+        "   - reasons: 字符串数组，2-5条要点\n"
+        "   - evidence_refs: 数组，{sheet, cell_or_range, excerpt}。excerpt必须逐字来自摘录/上下文。fail时必填。\n"
+        "   - llm_comment: 字符串（向后兼容）\n"
+        "   - llm_missing_evidence: 字符串数组（向后兼容）\n"
+        "   - llm_next_actions: 字符串数组（向后兼容）\n"
+        "   - risk_type: 覆盖性/一致性/证据不足/方法性/逻辑性/跨字段一致性\n"
+        "   - fix_suggestion: {missing_field, supplement_explanation, required_evidence_type}\n"
+        "   - unknown_reason: 当status=unknown时必填，≥10字符\n"
+        "5) 不要输出Markdown代码块，不要输出多余解释文字。\n"
     )
 
     for start in range(0, len(selected), max(1, int(batch_size))):
@@ -1736,12 +2504,63 @@ def _llm_review_findings(
                 idx = obj.get("id")
                 if not isinstance(idx, int):
                     continue
+                # --- status 迁移 ---
+                raw_status = str(obj.get("status", "")).strip()
+                if raw_status == "成立":
+                    status = "fail"
+                elif raw_status == "不成立":
+                    status = "pass"
+                elif raw_status == "不确定":
+                    status = "unknown"
+                else:
+                    status = raw_status or str(obj.get("llm_validity", "")).strip()
+                    # 从 llm_validity 推断
+                    if not status:
+                        lv = str(obj.get("llm_validity", "")).strip()
+                        if lv == "成立":
+                            status = "fail"
+                        elif lv == "不成立":
+                            status = "pass"
+                        elif lv == "不确定":
+                            status = "unknown"
+                # severity 迁移
+                raw_sev = str(obj.get("severity") or obj.get("llm_severity", "")).strip()
+                severity = _SEVERITY_FROM_CHINESE.get(raw_sev, raw_sev)
+                # evidence_refs
+                raw_refs = obj.get("evidence_refs")
+                evidence_refs_list: List[dict] = []
+                if isinstance(raw_refs, list) and raw_refs:
+                    for ref in raw_refs:
+                        if not isinstance(ref, dict):
+                            continue
+                        evidence_refs_list.append({
+                            "sheet": str(ref.get("sheet", "")).strip(),
+                            "cell_or_range": str(ref.get("cell_or_range", "")).strip(),
+                            "attachment": str(ref.get("attachment", "")).strip(),
+                            "excerpt": str(ref.get("excerpt", "")).strip(),
+                        })
+                # reasons
+                reasons_raw = obj.get("reasons", [])
+                reasons_list = [str(r).strip() for r in reasons_raw if r] if isinstance(reasons_raw, list) else []
+                # fix_suggestion
+                fix_sug = obj.get("fix_suggestion") or {}
+                if not isinstance(fix_sug, dict):
+                    fix_sug = {}
                 results[idx] = {
                     "llm_validity": str(obj.get("llm_validity", "")).strip(),
                     "llm_severity": str(obj.get("llm_severity", "")).strip(),
                     "llm_comment": str(obj.get("llm_comment", "")).strip(),
                     "llm_missing_evidence": json.dumps(obj.get("llm_missing_evidence", []), ensure_ascii=False),
                     "llm_next_actions": json.dumps(obj.get("llm_next_actions", []), ensure_ascii=False),
+                    # --- 新增结构化字段 ---
+                    "llm_status": status,
+                    "llm_severity_p": severity,
+                    "llm_conclusion": str(obj.get("conclusion", "")).strip(),
+                    "llm_reasons": json.dumps(reasons_list, ensure_ascii=False),
+                    "llm_evidence_refs": json.dumps(evidence_refs_list, ensure_ascii=False),
+                    "llm_risk_type": str(obj.get("risk_type", "")).strip(),
+                    "llm_fix_suggestion": json.dumps(fix_sug, ensure_ascii=False),
+                    "llm_unknown_reason": str(obj.get("unknown_reason", "")).strip(),
                 }
 
         stage = "review_findings"
@@ -1783,6 +2602,14 @@ def _llm_review_findings(
                             "llm_comment": f"LLM调用失败: {err1}",
                             "llm_missing_evidence": "[]",
                             "llm_next_actions": "[]",
+                            "llm_status": "unknown",
+                            "llm_severity_p": "P2",
+                            "llm_conclusion": "LLM调用失败",
+                            "llm_reasons": "[]",
+                            "llm_evidence_refs": "[]",
+                            "llm_risk_type": "",
+                            "llm_fix_suggestion": "{}",
+                            "llm_unknown_reason": "LLM调用失败，无法复核",
                         }
             else:
                 print(f"LLM复核失败: {start + 1}-{end}/{len(selected)}: {last_error}", flush=True)
@@ -1793,6 +2620,14 @@ def _llm_review_findings(
                         "llm_comment": f"LLM调用失败: {last_error}",
                         "llm_missing_evidence": "[]",
                         "llm_next_actions": "[]",
+                        "llm_status": "unknown",
+                        "llm_severity_p": "P2",
+                        "llm_conclusion": "LLM调用失败",
+                        "llm_reasons": "[]",
+                        "llm_evidence_refs": "[]",
+                        "llm_risk_type": "",
+                        "llm_fix_suggestion": "{}",
+                        "llm_unknown_reason": "LLM调用失败，无法复核",
                     }
 
         if sleep_seconds > 0:
@@ -1813,7 +2648,30 @@ def _llm_judge_procedure_pair(
             return s
         return s[:limit] + "..."
 
-    system_prompt = (
+    # 优先请求结构化 JSON 输出
+    system_prompt_json = (
+        "你是一名严格的审计质量复核专家。\n"
+        "你的任务：对比A列的【标准审计程序描述】与C列的【实际执行程序】，判断执行是否满足标准的控制意图与关键要求。\n\n"
+        "重要说明（用于降低误报）：\n"
+        "1) 标准描述通常是“规范流程/参考口径”，不要求与执行描述在措辞、人名、部门称谓、文件标题完全一致。\n"
+        "2) 访谈对象：若执行访谈对象属于同职能部门/同职责岗位，且能覆盖标准要验证的控制点，可视为符合；仅当职责明显不匹配或关键岗位未覆盖时才判不符合。\n"
+        "3) 检查文件：若执行检查的制度/规范/流程文件与标准要求主题一致、适用范围一致或更高层级覆盖，可视为符合；仅当文件主题不相关或未覆盖关键控制要素时才判不符合。\n"
+        "4) 结论表述：允许文字概括，但必须覆盖标准中的关键条件/核查点；若仅泛泛表述而未触及关键条件，则应判不符合或不确定。\n"
+        "5) 无发生/不适用：若执行描述明确说明审计期间内该事项/活动未发生（如无迁移/无开发项目/无重大变更等），且给出总体为0或无发生的依据（例如项目清单/变更台账/发布记录/日志导出等），则可判pass并在理由中说明“不适用/总体为0”；若仅口头说明且缺少依据，则判unknown。\n\n"
+        "判断规则：\n"
+        "1. 标准描述中要求的审计动作，实际执行中是否包含\n"
+        "2. 标准描述中指定的审计对象，实际执行中是否覆盖\n"
+        "3. 标准描述中提出的具体条件，实际执行中是否满足\n"
+        "4. 标准描述中要求获取的审计证据类型，实际执行中是否获取\n\n"
+        "输出要求：必须输出严格JSON对象，格式为：\n"
+        "{\"status\": \"pass\"|\"fail\"|\"unknown\", \"reason\": \"...\", "
+        "\"evidence_refs\": [{\"cell\": \"...\", \"excerpt\": \"...\"}], "
+        "\"unknown_reason\": \"...\"}\n"
+        "evidence_refs: status=fail时必填，excerpt必须来自执行描述或标准描述的原文片段。"
+        "status=unknown时unknown_reason必填（≥10字符）。"
+    )
+    # 旧格式 fallback prompt
+    system_prompt_old = (
         "你是一名严格的审计质量复核专家。\n"
         "你的任务：对比A列的【标准审计程序描述】与C列的【实际执行程序】，判断执行是否满足标准的控制意图与关键要求。\n\n"
         "重要说明（用于降低误报）：\n"
@@ -1839,16 +2697,46 @@ def _llm_judge_procedure_pair(
     )
 
     stage = "procedure_pair"
+    # 优先尝试 JSON 输出
     try:
         answer = _llm_chat(
             client=client,
             model=model,
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": system_prompt_json},
                 {"role": "user", "content": user_prompt},
             ],
             stage=stage,
             max_attempts=3,
+            temperature=0.1,
+            max_tokens=512,
+        )
+        answer = (answer or "").strip()
+        parsed = _try_parse_json(answer)
+        if isinstance(parsed, dict) and "status" in parsed:
+            status_val = str(parsed.get("status", "")).strip()
+            if status_val == "pass":
+                is_match = True
+            elif status_val == "fail":
+                is_match = False
+            else:
+                is_match = None
+            reason = str(parsed.get("reason", "")).strip() or str(parsed.get("unknown_reason", "")).strip()
+            return True, is_match, reason, answer
+    except Exception:
+        pass
+
+    # Fallback：使用旧 prompt 重试一次，再正则解析
+    try:
+        answer = _llm_chat(
+            client=client,
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt_old},
+                {"role": "user", "content": user_prompt},
+            ],
+            stage=stage,
+            max_attempts=2,
             temperature=0.1,
             max_tokens=512,
         )
@@ -2141,29 +3029,116 @@ def _llm_check_procedure_pairs(
                 if result_label in {"✗ 不符合", "API错误", "不确定"}:
                     issue_details.append(record)
 
+                    ev_refs = [{
+                        "sheet": ws.title,
+                        "cell_or_range": execution_cell,
+                        "excerpt": c_for_judge[:_EXCERPT_MAX_LEN],
+                    }]
+                    ev_refs = _verify_evidence_refs(ev_refs, ws)
+
                     if result_label == "✗ 不符合":
                         issue_type, sev, sug = _classify_mismatch(a_for_judge, c_for_judge, reason or raw or "")
+                        # severity 迁移：高/中/低 → P0/P1/P2
+                        sev_p = _SEVERITY_FROM_CHINESE.get(sev, sev)
+                        # status: fail；如果 evidence_refs 验证后为空则降级
+                        proc_status = "fail"
+                        proc_unknown = ""
+                        if not ev_refs:
+                            proc_status = "unknown"
+                            proc_unknown = "无法引用原始证据佐证该判定，降级为不确定"
+                            sev_p = "P2"
+                        # 构造分层 basis
+                        basis_parts = []
+                        if a_for_judge:
+                            basis_parts.append("标准程序: " + _truncate(a_for_judge, 800))
+                        if reason or raw:
+                            basis_parts.append("LLM依据: " + _truncate(reason or raw, 2000))
+                        if ev_refs:
+                            basis_parts.append(
+                                "引用: " + "; ".join(
+                                    f"{r.get('cell_or_range', '')}: {r.get('excerpt', '')[:200]}"
+                                    for r in ev_refs[:2] if r.get('excerpt')
+                                )
+                            )
+                        if proc_unknown:
+                            basis_parts.append("不确定原因: " + proc_unknown)
                         findings.append(
                             Finding(
                                 issue_type=issue_type,
-                                severity=sev,
+                                severity=sev_p,
                                 sheet=ws.title,
                                 cell=execution_cell,
                                 snippet=_truncate(c_for_judge, 220),
-                                basis=_truncate(reason or raw or "LLM判定为不符合", 800),
+                                basis=_truncate("\n".join(p for p in basis_parts if p), 3000),
                                 suggestion=sug,
+                                status=proc_status,
+                                risk_type="一致性",
+                                evidence_refs=json.dumps(ev_refs, ensure_ascii=False),
+                                conclusion=f"执行程序与标准审计程序在 {execution_cell} 不一致",
+                                reasons=json.dumps([_truncate(reason or raw, 300)] if (reason or raw) else [], ensure_ascii=False),
+                                fix_suggestion_detail=json.dumps({"supplement_explanation": sug[:300]}, ensure_ascii=False),
+                                unknown_reason=proc_unknown,
+                            )
+                        )
+                    elif result_label == "API错误":
+                        # LLM 调用超时/报错 → 无法自动判定，降级为 unknown
+                        err_detail = reason or raw or "API请求超时或返回错误"
+                        findings.append(
+                            Finding(
+                                issue_type="A-C对应性：LLM调用失败（需人工复核）",
+                                severity="P1",
+                                sheet=ws.title,
+                                cell=execution_cell,
+                                snippet=_truncate(c_for_judge, 220),
+                                basis=_truncate(
+                                    f"标准程序: {_truncate(a_for_judge, 400)}\n"
+                                    f"LLM调用失败详情: {err_detail[:800]}\n"
+                                    "无法自动判定「标准审计程序」与「实际执行程序」的对应性，"
+                                    "请人工对比以下两项：\n"
+                                    f"  A列（标准）: {_truncate(a_for_judge, 200)}\n"
+                                    f"  C列（执行）: {_truncate(c_for_judge, 200)}",
+                                    3000,
+                                ),
+                                suggestion=(
+                                    "人工复核步骤：\n"
+                                    "1) 对照A列标准审计程序，逐项检查C列执行是否覆盖要求的审计动作、对象、条件与证据类型；\n"
+                                    '2) 如实际已覆盖，在底稿中补充「证据→核查点→结论」的对应说明；\n'
+                                    "3) 如确实未覆盖，作为缺陷记录并提出整改。"
+                                ),
+                                status="unknown",
+                                unknown_reason=f"LLM调用失败（{err_detail[:200]}），无法自动判定，需人工复核",
+                                risk_type="证据不足",
+                                evidence_refs=json.dumps(ev_refs, ensure_ascii=False),
                             )
                         )
                     else:
+                        # result_label == "不确定"：LLM 返回了结果但无法明确判断
+                        llm_partial = reason or raw or ""
                         findings.append(
                             Finding(
-                                issue_type="LLM判定：对应性检查失败/不确定",
-                                severity="中",
+                                issue_type="A-C对应性：LLM无法判定（需人工确认）",
+                                severity="P1",
                                 sheet=ws.title,
                                 cell=execution_cell,
                                 snippet=_truncate(c_for_judge, 220),
-                                basis=_truncate(reason or raw or "LLM调用失败或返回不确定", 800),
-                                suggestion="检查LLM接口配置（API Key/Base URL/模型名）与网络连通性；必要时缩短单元格内容或重试。",
+                                basis=_truncate(
+                                    f"标准程序: {_truncate(a_for_judge, 400)}\n"
+                                    f"LLM分析: {_truncate(llm_partial, 800)}\n"
+                                    f"LLM无法确认标准与执行是否一致，建议人工判断覆盖性。",
+                                    3000,
+                                ),
+                                suggestion=(
+                                    "人工确认步骤：\n"
+                                    "1) 逐条核对：A列每个审计动作/对象/条件是否在C列中有对应描述；\n"
+                                    "2) 关注差异点：访谈对象是否覆盖关键岗位、检查文件是否主题一致、"
+                                    "是否有替代性程序覆盖同一控制点；\n"
+                                    "3) 如确认不符合，补充完整执行程序；如确认符合，在底稿中写明对应关系。"
+                                ),
+                                status="unknown",
+                                unknown_reason=f"LLM无法明确判定标准审计程序与实际执行程序的一致性"
+                                + (f"（LLM分析: {_truncate(llm_partial, 150)}）" if llm_partial else ""),
+                                risk_type="证据不足",
+                                evidence_refs=json.dumps(ev_refs, ensure_ascii=False),
                             )
                         )
 
@@ -2234,11 +3209,35 @@ def _merge_cell_duplicates(
                 llm_fail += 1
             merged = _deterministic_merge_cell(items)
 
+        # --- 合并新字段：取第一条的 status/risk_type/evidence_refs_summary/fix_suggestion/unknown_reason/needs_review ---
+        # 优先保留 fail/P0 的；若全部 unknown 则取第一项
+        best_status = "unknown"
+        best_status_idx = 0
+        sev_rank = {"P0": 0, "P1": 1, "P2": 2}
+        best_sev_rank = 9
+        for j, it in enumerate(items):
+            st = str(it.get("status", ""))
+            sv = str(it.get("severity", ""))
+            r = sev_rank.get(sv, 9)
+            if st == "fail" and r < best_sev_rank:
+                best_sev_rank = r
+                best_status = st
+                best_status_idx = j
+            elif st != "unknown" and best_status == "unknown":
+                best_status = st
+                best_status_idx = j
+        merged_first = items[best_status_idx]
         combined_rows[idxs[0]] = {
             "sheet": sheet,
             "cell": cell,
             "excerpt": max((str(it.get("excerpt", "")) for it in items), key=len),
             "llm": items[0].get("llm", {}),
+            "status": merged_first.get("status", "unknown"),
+            "risk_type": merged_first.get("risk_type", ""),
+            "evidence_refs_summary": merged_first.get("evidence_refs_summary", ""),
+            "fix_suggestion": merged_first.get("fix_suggestion", ""),
+            "unknown_reason": merged_first.get("unknown_reason", ""),
+            "needs_review": merged_first.get("needs_review", ""),
             **merged,
         }
         for i in idxs[1:]:
@@ -2263,14 +3262,14 @@ def _merge_cell_duplicates(
 
 
 def _deterministic_merge_cell(items):
-    sev_rank = {"高": 0, "中": 1, "低": 2}
-    best_sev = "中"
+    sev_rank = {"P0": 0, "高": 0, "P1": 1, "中": 1, "P2": 2, "低": 2}
+    best_sev = "P1"
     best_r = 999
     for it in items:
-        r = sev_rank.get(str(it.get("severity", "中")), 9)
+        r = sev_rank.get(str(it.get("severity", "P1")), 9)
         if r < best_r:
             best_r = r
-            best_sev = str(it.get("severity", "中"))
+            best_sev = str(it.get("severity", "P1"))
 
     seen = set()
     issue_parts = []
@@ -2521,6 +3520,30 @@ def _write_report_xlsx(
             return s
         return s[:limit] + "..."
 
+    def _build_evidence_refs_summary_from_ac(it: dict) -> str:
+        """Build an evidence_refs_summary string from an A-C correspondence issue dict.
+
+        A-C issues come from _llm_check_procedure_pairs and have execution_cell, c_text,
+        and optionally reason. We construct a summary similar to what Finding objects produce.
+        """
+        parts: List[str] = []
+        cell = str(it.get("execution_cell", "") or "").strip()
+        c_text = str(it.get("c_text", "") or "").strip()
+        sheet = str(it.get("sheet", "") or "").strip()
+        reason = str(it.get("reason", "") or "").strip()
+
+        if cell:
+            head = cell
+            if sheet:
+                head = f"{sheet}!{cell}" if cell else sheet
+            line = f"[{head}]"
+            if c_text:
+                line += f"\n    摘录: {c_text[:_EXCERPT_MAX_LEN]}"
+            parts.append(line)
+        if not parts and reason:
+            parts.append(f"[依据] {reason[:_EXCERPT_MAX_LEN]}")
+        return "\n".join(parts)
+
     def _extract_cell_refs(text: str) -> List[str]:
         if not text:
             return []
@@ -2639,12 +3662,17 @@ def _write_report_xlsx(
     headers = [
         "Sheet",
         "来源",
+        "状态",
         "严重级别",
+        "风险类型",
         "问题类型/结果",
         "单元格",
         "原文全文",
+        "证据引用",
         "判定依据/理由",
-        "整改建议",
+        "整改建议(结构化)",
+        "不确定原因",
+        "需复核",
     ]
     include_llm_review_cols = bool(os.getenv("INCLUDE_LLM_REVIEW_COLS", "").strip())
     if llm_results is not None and include_llm_review_cols:
@@ -2655,28 +3683,77 @@ def _write_report_xlsx(
         cell.alignment = Alignment(vertical="top")
     ws_issues.freeze_panes = "A2"
 
-    widths = [14, 12, 10, 28, 10, 70, 70, 60]
+    widths = [14, 12, 8, 10, 14, 28, 10, 60, 100, 100, 60, 30, 10]
     if llm_results is not None and include_llm_review_cols:
         widths.extend([12, 14, 70, 50, 50])
     for idx, w in enumerate(widths, start=1):
         ws_issues.column_dimensions[get_column_letter(idx)].width = w
 
     def _sev_rank(sev: str) -> int:
-        return {"高": 0, "中": 1, "低": 2}.get(str(sev or "").strip(), 9)
+        # 同时支持新 P0/P1/P2 和旧 高/中/低
+        s = str(sev or "").strip()
+        return {"P0": 0, "高": 0, "P1": 1, "中": 1, "P2": 2, "低": 2}.get(s, 9)
 
     combined_rows: List[Dict[str, object]] = []
     for idx, item in enumerate(findings_sorted, start=1):
         llm = llm_results.get(idx) if llm_results is not None else None
+        # 解析 evidence_refs JSON 字符串
+        try:
+            refs_list = json.loads(item.evidence_refs) if item.evidence_refs else []
+        except Exception:
+            refs_list = []
+        # 多行格式：每个 ref 一行，包含 sheet、cell、attachment、excerpt
+        # （不截断 excerpt，让审计员能完整看到原文）
+        refs_lines: List[str] = []
+        for ref in refs_list[:6]:
+            if not isinstance(ref, dict):
+                continue
+            parts: List[str] = []
+            sheet_label = str(ref.get("sheet", "") or "").strip()
+            cell_label = str(ref.get("cell_or_range", "") or "").strip()
+            if sheet_label and sheet_label != item.sheet:
+                parts.append(sheet_label)
+            if cell_label:
+                parts.append(cell_label)
+            attach = str(ref.get("attachment", "") or "").strip()
+            excerpt = str(ref.get("excerpt", "") or "").strip()
+            head = "/".join(parts) if parts else "?"
+            line = f"[{head}]"
+            if attach:
+                line += f" 附件={attach}"
+            if excerpt:
+                line += f"\n    摘录: {excerpt}"
+            refs_lines.append(line)
+        refs_summary = "\n".join(refs_lines)
+        # 解析 fix_suggestion_detail
+        try:
+            fix_sug = json.loads(item.fix_suggestion_detail) if item.fix_suggestion_detail else {}
+        except Exception:
+            fix_sug = {}
+        fix_sug_parts = []
+        if isinstance(fix_sug, dict):
+            if fix_sug.get("missing_field"):
+                fix_sug_parts.append(f"缺: {fix_sug['missing_field'][:200]}")
+            if fix_sug.get("supplement_explanation"):
+                fix_sug_parts.append(f"补: {fix_sug['supplement_explanation'][:200]}")
+            if fix_sug.get("required_evidence_type"):
+                fix_sug_parts.append(f"需证据: {fix_sug['required_evidence_type'][:200]}")
+        fix_sug_text = " | ".join(fix_sug_parts) if fix_sug_parts else _safe_cell_text(item.suggestion)
         combined_rows.append(
             {
                 "sheet": item.sheet,
                 "source": "规则/启发式",
+                "status": item.status,
                 "severity": item.severity,
+                "risk_type": item.risk_type,
                 "issue": item.issue_type,
                 "cell": item.cell or "-",
                 "excerpt": _full_excerpt(item.sheet, item.cell, item.snippet),
+                "evidence_refs_summary": refs_summary,
                 "basis": _safe_cell_text(item.basis),
-                "suggestion": _safe_cell_text(item.suggestion),
+                "fix_suggestion": fix_sug_text,
+                "unknown_reason": item.unknown_reason,
+                "needs_review": "是" if item.needs_review else "",
                 "llm": llm or {},
             }
         )
@@ -2688,18 +3765,21 @@ def _write_report_xlsx(
                 if not isinstance(it, dict):
                     continue
                 result = str(it.get("result", "") or "").strip()
-                sev = "中"
+                # Use internal P0/P1/P2 severity (consistent with Finding dataclass)
+                sev = "P1"
                 if "✗" in result or "不符合" in result:
-                    sev = "高"
+                    sev = "P0"
                 elif "API" in result:
-                    sev = "中"
+                    sev = "P1"
                 elif "不确定" in result:
-                    sev = "中"
+                    sev = "P1"
                 combined_rows.append(
                     {
                         "sheet": str(it.get("sheet", "") or "").strip(),
                         "source": "LLM对应性",
+                        "status": "fail" if "不符合" in result else ("unknown" if "不确定" in result or "API" in result else "pass"),
                         "severity": sev,
+                        "risk_type": "一致性",
                         "issue": f"A-C对应性：{result}" if result else "A-C对应性：问题",
                         "cell": str(it.get("execution_cell", "") or "").strip() or "-",
                         "excerpt": _full_excerpt(
@@ -2707,8 +3787,11 @@ def _write_report_xlsx(
                             str(it.get("execution_cell", "") or "").strip(),
                             it.get("c_text", "") or "",
                         ),
+                        "evidence_refs_summary": _build_evidence_refs_summary_from_ac(it),
                         "basis": _safe_cell_text(it.get("reason", "") or ""),
-                        "suggestion": "对照标准审计程序，补充/修订执行步骤与证据，写清“证据→核查点→结论”的对应关系。",
+                        "fix_suggestion": "对照标准审计程序，补充/修订执行步骤与证据，写清「证据→核查点→结论」的对应关系。",
+                        "unknown_reason": "",
+                        "needs_review": "",
                         "llm": {},
                     }
                 )
@@ -2723,6 +3806,18 @@ def _write_report_xlsx(
 
     # Merge duplicate issues pointing to the same cell within the same sheet
     combined_rows = _merge_cell_duplicates(combined_rows, client=client, model=model)
+
+    # ── 交叉验证（补充）：合并后再次核查 ──
+    # 主要的 _cross_validate_finding 已在 generate_report 中对 Finding 对象运行，
+    # 此处对 combined_rows 中的 P0+fail/unknown+无证据 做补充检查。
+    for row_data in combined_rows:
+        status = str(row_data.get("status", ""))
+        sev = str(row_data.get("severity", ""))
+        # 统一检查 P0（含中文"高"）的 fail/unknown + 无证据
+        if sev in ("P0", "高") and status in ("fail", "unknown"):
+            ev_summary = str(row_data.get("evidence_refs_summary", "") or "").strip()
+            if not ev_summary:
+                row_data["needs_review"] = "是"
 
     def _cell_sort_key(cell):
         if not cell or cell == "-":
@@ -2745,7 +3840,7 @@ def _write_report_xlsx(
     merged_by_sev: Dict[str, int] = defaultdict(int)
     merged_by_typ: Dict[str, int] = defaultdict(int)
     for row_data in combined_rows:
-        merged_by_sev[str(row_data.get("severity", ""))] += 1
+        merged_by_sev[_SEVERITY_DISPLAY.get(str(row_data.get("severity", "")), str(row_data.get("severity", "")))] += 1
         merged_by_typ[str(row_data.get("issue", ""))] += 1
     ws_sum["B10"] = str(len(combined_rows))
     r_upd = _summary_sev_start_row
@@ -2766,15 +3861,21 @@ def _write_report_xlsx(
 
     rr = 2
     for row_data in combined_rows:
+        sev_disp = _SEVERITY_DISPLAY.get(str(row_data.get("severity", "")).strip(), str(row_data.get("severity", "")))
         row = [
             row_data.get("sheet", ""),
             row_data.get("source", ""),
-            row_data.get("severity", ""),
+            row_data.get("status", ""),
+            sev_disp,
+            row_data.get("risk_type", ""),
             row_data.get("issue", ""),
             row_data.get("cell", ""),
             row_data.get("excerpt", ""),
+            row_data.get("evidence_refs_summary", ""),
             row_data.get("basis", ""),
-            row_data.get("suggestion", ""),
+            row_data.get("fix_suggestion", ""),
+            row_data.get("unknown_reason", ""),
+            row_data.get("needs_review", ""),
         ]
         if llm_results is not None and include_llm_review_cols:
             llm = row_data.get("llm") if isinstance(row_data.get("llm"), dict) else {}
@@ -3020,7 +4121,7 @@ def generate_report(
         findings.append(
             Finding(
                 issue_type="跨测试点特权用户可能遗漏/结论联动不足",
-                severity="中",
+                severity="P1",
                 sheet="SA-4c / SA-5",
                 cell=None,
                 snippet=f"SA-4c管理员候选: {', '.join(sorted(sa_admins))} | SA-5执行/审批人候选: {', '.join(sorted(sa5_executors))}",
@@ -3054,6 +4155,52 @@ def generate_report(
         by_type[item.issue_type] += 1
 
     findings_sorted = sorted(findings, key=_sort_key)
+
+    # ── 证据验证 + 交叉校验 ──
+    # 对所有 Finding 运行 _verify_evidence_refs（LLM 发现的 evidence_refs 可能
+    # 包含不匹配的 excerpt）和 _cross_validate_finding（确定性规则校验）。
+    # Finding 是 frozen dataclass，用 dataclasses.replace 创建修改后的实例。
+    for i, f in enumerate(findings_sorted):
+        # 1) 验证 evidence_refs excerpt 是否匹配实际单元格文本
+        try:
+            ev_refs = json.loads(f.evidence_refs) if f.evidence_refs else []
+        except Exception:
+            ev_refs = []
+        if isinstance(ev_refs, list) and ev_refs and f.sheet in wb.sheetnames:
+            verified_refs = _verify_evidence_refs(ev_refs, wb[f.sheet])
+            if verified_refs != ev_refs:
+                findings_sorted[i] = dataclasses.replace(
+                    f, evidence_refs=json.dumps(verified_refs, ensure_ascii=False)
+                )
+
+        # 2) 交叉验证：标记 needs_review
+        f = findings_sorted[i]  # use potentially-updated version
+        cross_issues = _cross_validate_finding(f, wb)
+        if cross_issues:
+            f = dataclasses.replace(f, needs_review=True)
+            findings_sorted[i] = f
+
+    # 3) LLM 质疑复核：对 P0 和 needs_review 的 Finding 做一次质疑调用
+    challenge_count = 0
+    for i, f in enumerate(findings_sorted):
+        if f.severity == "P0" or f.needs_review:
+            if f.sheet not in wb.sheetnames:
+                continue
+            ws_for_ctx = wb[f.sheet]
+            minimal_ctx = _build_minimal_context(f, ws_for_ctx)
+            result = _challenge_finding_with_llm(
+                client=client,
+                model=str(resolved_model),
+                finding=f,
+                minimal_context=minimal_ctx,
+            )
+            if result == "disagree":
+                f = dataclasses.replace(f, needs_review=True)
+                # 保留原始结论但标记需复核
+                findings_sorted[i] = f
+                challenge_count += 1
+    if challenge_count:
+        print(f"LLM质疑复核: {challenge_count} 条发现被质疑标记为需复核", flush=True)
 
     llm_results: Optional[Dict[int, Dict[str, str]]] = None
     llm_results = _llm_review_findings(
